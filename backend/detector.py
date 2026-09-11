@@ -99,6 +99,9 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
         dt = row['dt']
         curr = str(row['currency']).strip().upper()
 
+        has_source_fee = bool(row['has_source_fee']) if 'has_source_fee' in row else True
+        has_source_net = bool(row['has_source_net']) if 'has_source_net' in row else True
+
         raw_records.append({
             "index": idx,
             "transaction_id": tx_id,
@@ -110,6 +113,8 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
             "fee": fee,
             "net_amount": net,
             "currency": curr,
+            "has_source_fee": has_source_fee,
+            "has_source_net": has_source_net,
             "flags": [],
             "raw_data": row['raw_data']
         })
@@ -408,8 +413,8 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
         has_source_fee = bool(rec.get("has_source_fee", True))
         has_source_net = bool(rec.get("has_source_net", True))
 
-        # RULE 4: NET_AMOUNT_INCONSISTENCY (REVIEW_REQUIRED) - ONLY IF SOURCE NET WAS SUPPLIED
-        if has_source_net:
+        # RULE 4: NET_AMOUNT_INCONSISTENCY (REVIEW_REQUIRED) - ONLY IF BOTH SOURCE NET AND SOURCE FEE WERE SUPPLIED
+        if has_source_net and has_source_fee:
             expected_net = (gross - fee).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
             if abs(net - expected_net) > Decimal("0.01"):
                 diff = abs(net - expected_net).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)

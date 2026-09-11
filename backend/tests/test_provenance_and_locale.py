@@ -64,5 +64,27 @@ class TestProvenanceAndLocale(unittest.TestCase):
         has_net_math = any(item.rule_id == RULE_NET_MATH for item in summary.review_issue_ledger)
         self.assertFalse(has_net_math, "NET_AMOUNT_INCONSISTENCY must not run when net column is absent")
 
+    def test_absent_fee_with_present_net_prevents_net_amount_inconsistency(self):
+        """
+        TEST PROVENANCE — source net present, fee column absent
+        Expected: validation succeeds, has_source_net = True, has_source_fee = False,
+        NET_AMOUNT_INCONSISTENCY does NOT run, HIGH_FEE_DETECTED does NOT run.
+        """
+        csv_data = (
+            "transaction_id,order_id,date,type,gross_amount,net_amount,currency\n"
+            "tx_1,ord_1,2026-01-01,sale,100.00,97.00,USD\n"
+        ).encode('utf-8')
+        val_res, df = validate_and_normalize_csv(csv_data)
+        self.assertTrue(val_res.is_valid)
+        self.assertTrue(df.iloc[0]['has_source_net'])
+        self.assertFalse(df.iloc[0]['has_source_fee'])
+
+        summary, txs = analyze_transactions(df)
+        has_net_math = any(item.rule_id == RULE_NET_MATH for item in summary.review_issue_ledger)
+        has_high_fee = any(item.rule_id == RULE_HIGH_FEE for item in summary.review_issue_ledger)
+
+        self.assertFalse(has_net_math, "NET_AMOUNT_INCONSISTENCY must not run when fee column is absent")
+        self.assertFalse(has_high_fee, "HIGH_FEE_DETECTED must not run when fee column is absent")
+
 if __name__ == "__main__":
     unittest.main()
