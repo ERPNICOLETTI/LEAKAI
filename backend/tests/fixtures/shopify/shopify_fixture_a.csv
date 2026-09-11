@@ -1,0 +1,2 @@
+Transaction Date,Type,Order,Amount,Fee,Net,Payout Date,Payout Currency,Transaction ID
+2026-01-05,charge,#1001,150.00,4.35,145.65,2026-01-07,USD,tx_sp_1001
