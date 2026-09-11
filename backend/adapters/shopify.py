@@ -16,18 +16,28 @@ except ImportError:
 
 MONEY_QUANT = Decimal("0.01")
 
-# Official Shopify Payments Transactions export schema headers
-# Reference: https://help.shopify.com/en/manual/shopify-payments/reporting/payouts#export-payouts-or-transactions
+# Current official Shopify Payments Payout Transactions CSV headers
+# Reference: https://help.shopify.com/en/manual/payments/shopify-payments/payouts/view-details
 SHOPIFY_PAYMENTS_REQUIRED_HEADERS = [
     "Transaction Date",
     "Type",
     "Order",
     "Amount",
     "Fee",
-    "Net",
-    "Payout Date",
-    "Payout Currency"
+    "Net"
 ]
+
+# Supported Shopify transaction types with deterministic financial semantics
+SUPPORTED_SHOPIFY_TYPES = {
+    "charge": "sale",
+    "sale": "sale",
+    "payment": "sale",
+    "refund": "refund",
+    "fee": "fee",
+    "payout": "payout",
+    "dispute": "chargeback",
+    "chargeback": "chargeback"
+}
 
 class ShopifyAdapter:
     PROVIDER = "SHOPIFY"
@@ -44,17 +54,22 @@ class ShopifyAdapter:
         is_exact = len(missing) == 0
 
         return DetectionResult(
-            provider_detected=cls.PROVIDER if is_exact else ("SHOPIFY" if confidence >= 0.75 else "UNKNOWN"),
+            provider_detected=cls.PROVIDER if is_exact else ("SHOPIFY" if confidence >= 0.8 else "UNKNOWN"),
             export_type_detected=cls.EXPORT_TYPE,
             confidence=confidence,
             required_columns_present=matched_required,
             missing_columns=missing,
-            ambiguous_match=not is_exact and confidence >= 0.75,
-            details="Shopify Payments Transactions export format"
+            ambiguous_match=not is_exact and confidence >= 0.8,
+            details="Shopify Payments Payout Transactions export format"
         )
 
     @classmethod
-    def validate_and_normalize(cls, df: pd.DataFrame, source_filename: str = "") -> Tuple[FileValidationResult, List[CanonicalEvent]]:
+    def validate_and_normalize(
+        cls, 
+        df: pd.DataFrame, 
+        source_filename: str = "",
+        fallback_currency: Optional[str] = None
+    ) -> Tuple[FileValidationResult, List[CanonicalEvent]]:
         detection = cls.detect(list(df.columns))
         if detection.missing_columns:
             return FileValidationResult(
@@ -80,27 +95,24 @@ class ShopifyAdapter:
 
             # 2. Kind / Type
             raw_type = str(row.get("Type", "")).strip().lower()
-            if raw_type in ["charge", "sale", "payment"]:
-                tx_type = "sale"
-            elif raw_type in ["refund"]:
-                tx_type = "refund"
-            elif raw_type in ["fee"]:
-                tx_type = "fee"
-            elif raw_type in ["payout"]:
-                tx_type = "payout"
-            elif raw_type in ["dispute", "chargeback"]:
-                tx_type = "chargeback"
+            if raw_type in SUPPORTED_SHOPIFY_TYPES:
+                tx_type = SUPPORTED_SHOPIFY_TYPES[raw_type]
             else:
-                row_errs.append(f"Row {row_num}: Unsupported Shopify transaction type '{raw_type}'")
+                row_errs.append(f"Row {row_num}: Unsupported Shopify event type '{raw_type}'. Type 'adjustment' and unknown events are blocked without explicit settlement evidence.")
                 tx_type = "UNKNOWN"
 
-            # 3. Currency
-            c_val = row.get("Payout Currency") or row.get("Currency")
-            try:
-                currency = validate_currency(c_val)
-            except Exception as e:
-                row_errs.append(f"Row {row_num}: Invalid currency - {str(e)}")
-                currency = "USD"
+            # 3. Currency Provenance Policy:
+            # Check CSV columns ('Currency', 'Payout Currency') first, then explicit upload metadata fallback_currency.
+            c_val = row.get("Payout Currency") or row.get("Currency") or fallback_currency
+            if not c_val or str(c_val).strip() == "":
+                row_errs.append(f"Row {row_num}: Currency missing in file and upload metadata. Analysis blocked to prevent financial guesswork.")
+                currency = ""
+            else:
+                try:
+                    currency = validate_currency(c_val)
+                except Exception as e:
+                    row_errs.append(f"Row {row_num}: Invalid currency '{c_val}' - {str(e)}")
+                    currency = ""
 
             # 4. Gross Amount
             g_val = row.get("Amount")
@@ -132,18 +144,19 @@ class ShopifyAdapter:
             order_ref = str(row.get("Order")).strip() if pd.notna(row.get("Order")) and str(row.get("Order")).strip() != "" else None
             payout_ref = str(row.get("Payout Date")).strip() if pd.notna(row.get("Payout Date")) and str(row.get("Payout Date")).strip() != "" else None
             
-            # Source Transaction ID (or synthetic order-scoped key if absent in raw CSV)
-            src_tx_id = str(row.get("Transaction ID")).strip() if pd.notna(row.get("Transaction ID")) and str(row.get("Transaction ID")).strip() != "" else f"SP-{order_ref or idx+1}-{tx_type}-{idx+1}"
+            # Authoritative source transaction ID
+            raw_tx_id = row.get("Transaction ID")
+            src_tx_id = str(raw_tx_id).strip() if pd.notna(raw_tx_id) and str(raw_tx_id).strip() != "" else None
+
+            # Internal unique row identity (provenance tracking only, NOT authoritative provider ID)
+            internal_event_id = f"SHOPIFY:{source_filename or 'FILE'}:ROW_{row_num}:V{cls.VERSION}"
 
             if row_errs:
                 errors.extend(row_errs)
                 continue
 
-            # Namespaced canonical ID
-            namespaced_id = f"SHOPIFY:{src_tx_id}"
-
             event = CanonicalEvent(
-                transaction_id=namespaced_id,
+                transaction_id=internal_event_id,
                 order_id=order_ref,
                 date=date_str,
                 type=tx_type,

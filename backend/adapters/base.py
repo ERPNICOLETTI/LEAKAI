@@ -20,7 +20,7 @@ class CanonicalEvent(BaseModel):
     export_type: str  # e.g. "SHOPIFY_PAYMENTS_TRANSACTIONS", "PAYPAL_ACTIVITY"
     source_file_id: Optional[str] = None
     source_row_number: int
-    source_transaction_id: str
+    source_transaction_id: Optional[str] = None
     source_order_reference: Optional[str] = None
     source_payout_reference: Optional[str] = None
     source_parent_reference: Optional[str] = None

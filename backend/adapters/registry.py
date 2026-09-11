@@ -1,5 +1,5 @@
 import pandas as pd
-from typing import Dict, Type, Tuple, List, Optional
+from typing import Dict, Type, Tuple, List, Optional, Any
 
 try:
     from adapters.base import DetectionResult, CanonicalEvent
@@ -14,6 +14,9 @@ except ImportError:
     from ..models import FileValidationResult
     from ..normalizer import validate_and_normalize_csv
 
+# Required headers for explicit GENERIC_CANONICAL_CSV mode
+GENERIC_REQUIRED_HEADERS = ["transaction_id", "date", "type", "gross_amount", "currency"]
+
 class AdapterRegistry:
     def __init__(self):
         self._adapters: List[Any] = [
@@ -22,17 +25,18 @@ class AdapterRegistry:
         ]
 
     def detect(self, headers: List[str]) -> DetectionResult:
+        clean_headers = [h.strip().lower() for h in headers]
+        
         matches = []
         for adapter in self._adapters:
             res = adapter.detect(headers)
-            if res.confidence >= 0.75:
+            if res.confidence >= 0.8:
                 matches.append((adapter, res))
 
         if len(matches) == 1 and not matches[0][1].ambiguous_match:
             return matches[0][1]
 
         if len(matches) > 1:
-            # Check if one is exact (1.0) and others are partial
             exact_matches = [m for m in matches if m[1].confidence == 1.0]
             if len(exact_matches) == 1:
                 return exact_matches[0][1]
@@ -45,12 +49,23 @@ class AdapterRegistry:
                 details="Analysis blocked: Ambiguous header match across multiple provider export schemas."
             )
 
+        # Check if file strictly matches GENERIC_CANONICAL_CSV schema
+        missing_generic = [h for h in GENERIC_REQUIRED_HEADERS if h not in clean_headers]
+        if not missing_generic:
+            return DetectionResult(
+                provider_detected="GENERIC",
+                export_type_detected="GENERIC_CANONICAL_CSV",
+                confidence=1.0,
+                ambiguous_match=False,
+                details="Generic canonical CSV format detected."
+            )
+
         return DetectionResult(
-            provider_detected="GENERIC",
-            export_type_detected="GENERIC_CANONICAL_CSV",
-            confidence=0.5,
+            provider_detected="UNKNOWN",
+            export_type_detected="UNSUPPORTED",
+            confidence=0.0,
             ambiguous_match=False,
-            details="Generic canonical CSV format detected."
+            details=f"Analysis blocked: CSV schema does not match any supported provider export signature and is missing required generic canonical headers {missing_generic}."
         )
 
     def process(self, df: pd.DataFrame, source_filename: str = "") -> Tuple[FileValidationResult, List[CanonicalEvent]]:

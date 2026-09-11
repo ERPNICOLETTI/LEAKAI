@@ -17,7 +17,7 @@ except ImportError:
 MONEY_QUANT = Decimal("0.01")
 
 # Official PayPal Activity Download CSV header signature
-# Reference: https://www.paypal.com/us/smarthelp/article/how-do-i-download-a-history-log-of-my-paypal-transactions-ts1417
+# Reference: https://developer.paypal.com/reports/activity-download/
 PAYPAL_ACTIVITY_REQUIRED_HEADERS = [
     "Date",
     "Time",
@@ -47,12 +47,12 @@ class PayPalAdapter:
         is_exact = len(missing) == 0
 
         return DetectionResult(
-            provider_detected=cls.PROVIDER if is_exact else ("PAYPAL" if confidence >= 0.75 else "UNKNOWN"),
+            provider_detected=cls.PROVIDER if is_exact else ("PAYPAL" if confidence >= 0.8 else "UNKNOWN"),
             export_type_detected=cls.EXPORT_TYPE,
             confidence=confidence,
             required_columns_present=matched_required,
             missing_columns=missing,
-            ambiguous_match=not is_exact and confidence >= 0.75,
+            ambiguous_match=not is_exact and confidence >= 0.8,
             details="PayPal Activity Log export format"
         )
 
@@ -74,9 +74,10 @@ class PayPalAdapter:
             row_errs = []
 
             # 1. Transaction ID
-            src_tx_id = str(row.get("Transaction ID")).strip() if pd.notna(row.get("Transaction ID")) else ""
+            raw_tx = row.get("Transaction ID")
+            src_tx_id = str(raw_tx).strip() if pd.notna(raw_tx) and str(raw_tx).strip() != "" else None
             if not src_tx_id:
-                row_errs.append(f"Row {row_num}: PayPal Transaction ID is missing")
+                row_errs.append(f"Row {row_num}: PayPal Transaction ID is missing.")
 
             # 2. Date
             d_val = row.get("Date")
@@ -86,14 +87,14 @@ class PayPalAdapter:
                 row_errs.append(f"Row {row_num}: Invalid Date - {str(e)}")
                 date_str = ""
 
-            # 3. Type / Event Status
+            # 3. Type / Event Classification
             raw_type = str(row.get("Type", "")).strip().lower()
-            status = str(row.get("Status", "")).strip().lower()
-
+            
+            # Authoritative PayPal Event Classification
             if "payment received" in raw_type or "express checkout payment" in raw_type or "mobile payment" in raw_type or "general payment" in raw_type:
                 tx_type = "sale"
-            elif "refund" in raw_type or "payment sent" in raw_type:
-                tx_type = "refund" if "refund" in raw_type else ("refund" if parse_decimal_strict(row.get("Gross", "0.00")) < Decimal("0.00") else "sale")
+            elif "refund" in raw_type:
+                tx_type = "refund"
             elif "partner fee" in raw_type or "fee" in raw_type:
                 tx_type = "fee"
             elif "withdrawal" in raw_type or "bank deposit" in raw_type or "payout" in raw_type:
@@ -101,7 +102,8 @@ class PayPalAdapter:
             elif "dispute" in raw_type or "chargeback" in raw_type or "reversal" in raw_type:
                 tx_type = "chargeback"
             else:
-                row_errs.append(f"Row {row_num}: Unsupported PayPal event type '{raw_type}'")
+                # "Payment Sent" and unknown types are NOT assumed to be refunds simply because gross is negative.
+                row_errs.append(f"Row {row_num}: Unsupported PayPal event type '{raw_type}'. 'Payment Sent' and unverified transaction types are blocked without explicit refund classification.")
                 tx_type = "UNKNOWN"
 
             # 4. Currency
@@ -126,7 +128,7 @@ class PayPalAdapter:
             if has_fee:
                 try:
                     fee = parse_decimal_strict(row.get("Fee"))
-                    # PayPal fee is usually recorded as negative, e.g. -0.30. Normalize to positive fee expense.
+                    # PayPal fees are recorded as negative, e.g. -0.30. Normalize to positive fee expense.
                     if fee < Decimal("0.00"):
                         fee = abs(fee)
                 except Exception as e:
@@ -141,14 +143,22 @@ class PayPalAdapter:
                 except Exception as e:
                     row_errs.append(f"Row {row_num}: Invalid Net amount - {str(e)}")
 
-            # References
-            order_ref = str(row.get("Item ID")).strip() if pd.notna(row.get("Item ID")) and str(row.get("Item ID")).strip() != "" else None
-            if not order_ref and pd.notna(row.get("Invoice Number")) and str(row.get("Invoice Number")).strip() != "":
+            # Order Reference Priority (DO NOT use Item ID as order reference! Item ID is product-level metadata)
+            order_ref = None
+            if pd.notna(row.get("Invoice Number")) and str(row.get("Invoice Number")).strip() != "":
                 order_ref = str(row.get("Invoice Number")).strip()
-            if not order_ref and pd.notna(row.get("Custom Number")) and str(row.get("Custom Number")).strip() != "":
+            elif pd.notna(row.get("Invoice Number Text")) and str(row.get("Invoice Number Text")).strip() != "":
+                order_ref = str(row.get("Invoice Number Text")).strip()
+            elif pd.notna(row.get("Original Invoice ID")) and str(row.get("Original Invoice ID")).strip() != "":
+                order_ref = str(row.get("Original Invoice ID")).strip()
+            elif pd.notna(row.get("Custom Number")) and str(row.get("Custom Number")).strip() != "":
                 order_ref = str(row.get("Custom Number")).strip()
 
             parent_ref = str(row.get("Reference Txn ID")).strip() if pd.notna(row.get("Reference Txn ID")) and str(row.get("Reference Txn ID")).strip() != "" else None
+            item_id = str(row.get("Item ID")).strip() if pd.notna(row.get("Item ID")) and str(row.get("Item ID")).strip() != "" else None
+
+            if item_id:
+                raw_dict["_item_id_provenance"] = item_id
 
             if row_errs:
                 errors.extend(row_errs)
