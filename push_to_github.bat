@@ -18,8 +18,12 @@ if not exist ".git" (
     echo.
 )
 
-:: Prompt for commit message
-set /p COMMIT_MSG="Enter commit message (Press Enter for default: 'Update LeakAI software'): "
+:: Set commit message
+if "%~1"=="--no-pause" (
+    set COMMIT_MSG=Auto-update LeakAI software
+) else (
+    set /p COMMIT_MSG="Enter commit message (Press Enter for default: 'Update LeakAI software'): "
+)
 if "%COMMIT_MSG%"=="" set COMMIT_MSG=Update LeakAI software
 
 echo.
@@ -27,7 +31,7 @@ echo [+] Staging files...
 git add .
 
 echo [+] Committing changes...
-git commit -m "%COMMIT_MSG%"
+git commit -m "%COMMIT_MSG%" >nul 2>&1
 
 echo [+] Pushing to GitHub (https://github.com/ERPNICOLETTI/LEAKAI)...
 git push -u origin main
@@ -44,4 +48,4 @@ if %errorlevel% equ 0 (
 )
 
 echo.
-pause
+if not "%~1"=="--no-pause" pause
