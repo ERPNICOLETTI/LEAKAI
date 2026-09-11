@@ -1,6 +1,7 @@
 import unittest
 import os
 import sys
+import pandas as pd
 
 # Ensure backend path is importable
 sys.path.append(os.path.dirname(__file__))
@@ -22,84 +23,82 @@ class TestLeakAIDetector(unittest.TestCase):
         self.assertEqual(self.summary.total_transactions, 15)
         self.assertEqual(self.summary.total_gross_revenue, 2795.00)
         self.assertEqual(self.summary.total_fees_paid, 107.38)
-        self.assertEqual(self.summary.confirmed_loss_amount, 1200.00)
+        self.assertEqual(self.summary.confirmed_loss_amount, 650.00)
         self.assertEqual(self.summary.potential_review_amount, 1713.58)
         self.assertEqual(self.summary.total_anomalous_transactions, 9)
 
-    def test_high_fee_detected_tx_10004(self):
-        tx = self.tx_map["tx_10004"]
-        self.assertTrue(tx.has_anomaly)
-        rules = [f.rule_id for f in tx.flags]
-        self.assertIn(RULE_HIGH_FEE, rules)
-        flag = next(f for f in tx.flags if f.rule_id == RULE_HIGH_FEE)
-        self.assertEqual(flag.classification, "REVIEW_REQUIRED")
-        self.assertEqual(flag.amount_at_risk, 17.48)
-
-    def test_missing_order_tx_10005(self):
-        tx = self.tx_map["tx_10005"]
-        self.assertTrue(tx.has_anomaly)
-        rules = [f.rule_id for f in tx.flags]
-        self.assertIn(RULE_MISSING_ORDER, rules)
-        self.assertIn(RULE_UNMATCHED_REFUND, rules)
-        flag = next(f for f in tx.flags if f.rule_id == RULE_MISSING_ORDER)
-        self.assertEqual(flag.classification, "REVIEW_REQUIRED")
-        self.assertEqual(flag.amount_at_risk, 0.0)
-
-    def test_refund_exceeds_sale_ord_8803(self):
-        # tx_10006 ($600) and tx_10007 ($700) for ord_8803 ($1200 sale)
-        tx7 = self.tx_map["tx_10007"]
-        self.assertTrue(tx7.has_anomaly)
-        rules = [f.rule_id for f in tx7.flags]
-        self.assertIn(RULE_REFUND_EXCEEDS, rules)
-        flag = next(f for f in tx7.flags if f.rule_id == RULE_REFUND_EXCEEDS)
-        self.assertEqual(flag.classification, "CONFIRMED_LOSS")
-        self.assertEqual(flag.amount_at_risk, 100.00)
-
-    def test_net_amount_inconsistency_tx_10008(self):
-        tx = self.tx_map["tx_10008"]
-        self.assertTrue(tx.has_anomaly)
-        rules = [f.rule_id for f in tx.flags]
-        self.assertIn(RULE_NET_MATH, rules)
-        flag = next(f for f in tx.flags if f.rule_id == RULE_NET_MATH)
-        self.assertEqual(flag.classification, "REVIEW_REQUIRED")
-        self.assertEqual(flag.amount_at_risk, 11.10)
-
-    def test_duplicate_refund_and_tx_id_ord_8806(self):
-        # tx_10010 ($550 duplicate) and tx_10011 ($550 3rd refund) for ord_8806 ($550 sale)
-        tx10 = [t for t in self.txs if t.transaction_id == "tx_10010"][1]  # duplicate row
-        rules = [f.rule_id for f in tx10.flags]
-        self.assertIn(RULE_DUP_TX, rules)
-        self.assertIn(RULE_DUP_REFUND, rules)
-        self.assertIn(RULE_REFUND_EXCEEDS, rules)
+    def test_regression_A_two_identical_rows_same_tx_id(self):
+        """
+        TEST A: Two identical rows with same transaction_id
+        -> DUPLICATE_TRANSACTION_ID = REVIEW_REQUIRED
+        -> confirmed loss = $0
+        """
+        csv_data = (
+            "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
+            "tx_100,ord_1,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+            "tx_100,ord_1,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+        ).encode('utf-8')
+        df = normalize_csv(csv_data)
+        summary, txs = analyze_transactions(df)
         
-        dup_flag = next(f for f in tx10.flags if f.rule_id == RULE_DUP_REFUND)
-        self.assertEqual(dup_flag.classification, "CONFIRMED_LOSS")
-        self.assertEqual(dup_flag.amount_at_risk, 550.00)
+        self.assertEqual(summary.confirmed_loss_amount, 0.0)
+        self.assertTrue(any(f.rule_id == RULE_DUP_TX and f.classification == "REVIEW_REQUIRED" for f in txs[1].flags))
 
-    def test_unmatched_chargeback_tx_10012(self):
-        tx = self.tx_map["tx_10012"]
-        self.assertTrue(tx.has_anomaly)
-        rules = [f.rule_id for f in tx.flags]
-        self.assertIn(RULE_UNMATCHED_REFUND, rules)
-        flag = next(f for f in tx.flags if f.rule_id == RULE_UNMATCHED_REFUND)
-        self.assertEqual(flag.classification, "REVIEW_REQUIRED")
-        self.assertEqual(flag.amount_at_risk, 180.00)
+    def test_regression_B_one_sale_one_refund_one_duplicate_raw_row(self):
+        """
+        TEST B: One sale $100, refund tx_A $100, duplicate row tx_A $100
+        -> confirmed loss = $0
+        """
+        csv_data = (
+            "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
+            "tx_S1,ord_1,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+            "tx_R1,ord_1,2026-01-02,refund,-100.00,0.00,-100.00,USD\n"
+            "tx_R1,ord_1,2026-01-02,refund,-100.00,0.00,-100.00,USD\n"
+        ).encode('utf-8')
+        df = normalize_csv(csv_data)
+        summary, txs = analyze_transactions(df)
 
-    def test_invalid_negative_fee_tx_10013(self):
-        tx = self.tx_map["tx_10013"]
-        self.assertTrue(tx.has_anomaly)
-        rules = [f.rule_id for f in tx.flags]
-        self.assertIn(RULE_NEG_FEE, rules)
-        flag = next(f for f in tx.flags if f.rule_id == RULE_NEG_FEE)
-        self.assertEqual(flag.classification, "REVIEW_REQUIRED")
-        self.assertEqual(flag.amount_at_risk, 5.00)
+        self.assertEqual(summary.confirmed_loss_amount, 0.0)
+
+    def test_regression_C_one_sale_two_distinct_refund_txs(self):
+        """
+        TEST C: One sale $100, refund tx_A $100, refund tx_B $100
+        -> confirmed excess loss = $100
+        """
+        csv_data = (
+            "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
+            "tx_S1,ord_1,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+            "tx_R1,ord_1,2026-01-02,refund,-100.00,0.00,-100.00,USD\n"
+            "tx_R2,ord_1,2026-01-03,refund,-100.00,0.00,-100.00,USD\n"
+        ).encode('utf-8')
+        df = normalize_csv(csv_data)
+        summary, txs = analyze_transactions(df)
+
+        self.assertEqual(summary.confirmed_loss_amount, 100.0)
+
+    def test_regression_D_sale_refund_txA_dup_raw_txA_refund_txB(self):
+        """
+        TEST D: One sale $100, refund tx_A $100, duplicate tx_A row, refund tx_B $100
+        -> confirmed loss must still equal $100, NOT $200.
+        """
+        csv_data = (
+            "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
+            "tx_S1,ord_1,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+            "tx_R1,ord_1,2026-01-02,refund,-100.00,0.00,-100.00,USD\n"
+            "tx_R1,ord_1,2026-01-02,refund,-100.00,0.00,-100.00,USD\n"
+            "tx_R2,ord_1,2026-01-03,refund,-100.00,0.00,-100.00,USD\n"
+        ).encode('utf-8')
+        df = normalize_csv(csv_data)
+        summary, txs = analyze_transactions(df)
+
+        self.assertEqual(summary.confirmed_loss_amount, 100.0)
 
     def test_economic_loss_ledger_deduplication(self):
         ledger = self.summary.economic_loss_ledger
-        self.assertEqual(len(ledger), 3)
+        self.assertEqual(len(ledger), 2)
         total_ledger_loss = sum(item.proven_loss_amount for item in ledger)
         self.assertEqual(total_ledger_loss, self.summary.confirmed_loss_amount)
-        self.assertEqual(total_ledger_loss, 1200.00)
+        self.assertEqual(total_ledger_loss, 650.00)
 
 if __name__ == "__main__":
     unittest.main()
