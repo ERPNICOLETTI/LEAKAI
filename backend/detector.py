@@ -7,6 +7,7 @@ except ImportError:
     from .models import TransactionRecord, AnomalyFlag, AuditSummary, CategoryRisk, RuleBreakdown, EconomicLossItem
 
 RULE_DUP_TX = "DUPLICATE_TRANSACTION_ID"
+RULE_CONFLICTING_TX = "CONFLICTING_TRANSACTION_ID"
 RULE_DUP_REFUND = "POSSIBLE_DUPLICATED_REFUND"
 RULE_MISSING_ORDER = "MISSING_ORDER_ID"
 RULE_NET_MATH = "NET_AMOUNT_INCONSISTENCY"
@@ -21,9 +22,14 @@ RULE_METADATA = {
         "severity": "MEDIUM",
         "classification": "REVIEW_REQUIRED"
     },
+    RULE_CONFLICTING_TX: {
+        "name": "Conflicting Transaction ID Data",
+        "severity": "HIGH",
+        "classification": "REVIEW_REQUIRED"
+    },
     RULE_DUP_REFUND: {
         "name": "Possible Duplicated Refund",
-        "severity": "HIGH",
+        "severity": "MEDIUM",
         "classification": "REVIEW_REQUIRED"
     },
     RULE_MISSING_ORDER: {
@@ -90,28 +96,53 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
             "raw_data": row['raw_data']
         })
 
-    # DYNAMIC MEDIAN FEE BASELINE CALCULATION FROM NORMAL SALES
-    sale_fee_percentages = [
-        (r["fee"] / r["gross_amount"]) * 100.0
-        for r in raw_records
-        if r["type"] == "sale" and r["gross_amount"] > 0
-    ]
-    median_fee_pct = float(np.median(sale_fee_percentages)) if sale_fee_percentages else 3.0
-    fee_threshold_pct = max(median_fee_pct * 2.0, median_fee_pct + 5.0)
-
-    # RAW LAYER CHECK: DUPLICATE_TRANSACTION_ID (REVIEW_REQUIRED)
-    tx_id_raw_counts: Dict[str, List[int]] = {}
+    # RAW LAYER CHECK: DUPLICATE & CONFLICTING TRANSACTION IDs
+    tx_id_raw_groups: Dict[str, List[int]] = {}
     for i, r in enumerate(raw_records):
-        tx_id_raw_counts.setdefault(r["transaction_id"], []).append(i)
+        tx_id_raw_groups.setdefault(r["transaction_id"], []).append(i)
 
-    for t_id, indices in tx_id_raw_counts.items():
-        if len(indices) > 1 and t_id:
+    conflicting_tx_ids = set()
+
+    for t_id, indices in tx_id_raw_groups.items():
+        if not t_id or len(indices) <= 1:
+            continue
+
+        # Check if financial/metadata fields differ across rows sharing same transaction_id
+        first_rec = raw_records[indices[0]]
+        has_conflict = False
+
+        for idx in indices[1:]:
+            rec = raw_records[idx]
+            if (rec["order_id"] != first_rec["order_id"] or
+                rec["type"] != first_rec["type"] or
+                abs(rec["gross_amount"] - first_rec["gross_amount"]) > 0.001 or
+                abs(rec["fee"] - first_rec["fee"]) > 0.001 or
+                abs(rec["net_amount"] - first_rec["net_amount"]) > 0.001 or
+                rec["currency"] != first_rec["currency"]):
+                has_conflict = True
+                break
+
+        if has_conflict:
+            conflicting_tx_ids.add(t_id)
+            for idx in indices:
+                rec = raw_records[idx]
+                flag = AnomalyFlag(
+                    rule_id=RULE_CONFLICTING_TX,
+                    rule_name=RULE_METADATA[RULE_CONFLICTING_TX]["name"],
+                    severity="HIGH",
+                    classification="REVIEW_REQUIRED",
+                    description=f"Transaction ID '{t_id}' has conflicting monetary or metadata fields across raw rows. Excluded from confirmed loss reconciliation.",
+                    amount_at_risk=abs(rec["gross_amount"])
+                )
+                add_flag_if_missing(rec["flags"], flag)
+        else:
+            # Identical duplicate raw rows
             for idx in indices[1:]:
                 rec = raw_records[idx]
                 flag = AnomalyFlag(
                     rule_id=RULE_DUP_TX,
                     rule_name=RULE_METADATA[RULE_DUP_TX]["name"],
-                    severity=RULE_METADATA[RULE_DUP_TX]["severity"],
+                    severity="MEDIUM",
                     classification="REVIEW_REQUIRED",
                     description=f"Transaction ID '{t_id}' appears multiple times in raw export. Review export to verify if gateway double-settled.",
                     amount_at_risk=abs(rec["gross_amount"])
@@ -119,18 +150,31 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 add_flag_if_missing(rec["flags"], flag)
 
     # -------------------------------------------------------------------------
-    # 2. ECONOMIC EVENT LAYER: Deduplicate by transaction_id for reconciliation
+    # 2. ECONOMIC EVENT LAYER: Deduplicate non-conflicting unique transaction_ids
     # -------------------------------------------------------------------------
     seen_tx_ids = set()
     economic_events: List[Dict[str, Any]] = []
 
     for r in raw_records:
         t_id = r["transaction_id"]
+        # Exclude conflicting transaction IDs from economic event reconciliation
+        if t_id and t_id in conflicting_tx_ids:
+            continue
+        # Deduplicate identical transaction IDs (keep first occurrence)
         if t_id and t_id in seen_tx_ids:
-            continue  # Exclude raw duplicate export rows from economic event layer
+            continue
         if t_id:
             seen_tx_ids.add(t_id)
         economic_events.append(r)
+
+    # DYNAMIC MEDIAN FEE BASELINE CALCULATION FROM DEDUPLICATED ECONOMIC SALES
+    sale_fee_percentages = [
+        (ev["fee"] / ev["gross_amount"]) * 100.0
+        for ev in economic_events
+        if ev["type"] == "sale" and ev["gross_amount"] > 0 and ev["fee"] >= 0
+    ]
+    median_fee_pct = float(np.median(sale_fee_percentages)) if sale_fee_percentages else 3.0
+    fee_threshold_pct = max(median_fee_pct * 2.0, median_fee_pct + 5.0)
 
     # Index economic events by Order ID
     econ_order_map: Dict[str, List[Dict[str, Any]]] = {}
@@ -155,7 +199,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 flag = AnomalyFlag(
                     rule_id=RULE_UNMATCHED_REFUND,
                     rule_name=RULE_METADATA[RULE_UNMATCHED_REFUND]["name"],
-                    severity=RULE_METADATA[RULE_UNMATCHED_REFUND]["severity"],
+                    severity="MEDIUM",
                     classification="REVIEW_REQUIRED",
                     description=f"{ev['type'].upper()} of ${abs(ev['gross_amount']):,.2f} has no matching sale in dataset (may exist in prior statement).",
                     amount_at_risk=abs(ev["gross_amount"])
@@ -164,13 +208,12 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
 
     # ORDER-LEVEL MONETARY RECONCILIATION & ECONOMIC LOSS LEDGER
     economic_loss_ledger: List[EconomicLossItem] = []
-    proven_loss_tracker: Dict[str, float] = {}
 
     for o_id, events in econ_order_map.items():
         refund_events = [e for e in events if e["type"] == "refund"]
         has_sale = any(e["type"] == "sale" for e in events)
 
-        # RULE 2: POSSIBLE_DUPLICATED_REFUND (ECONOMIC LAYER)
+        # RULE 2: POSSIBLE_DUPLICATED_REFUND (ALWAYS REVIEW_REQUIRED IN GENERIC ENGINE)
         if len(refund_events) > 1:
             sorted_refunds = sorted(refund_events, key=lambda e: e["dt"] if pd.notna(e["dt"]) else pd.Timestamp.min)
             for k in range(1, len(sorted_refunds)):
@@ -184,59 +227,35 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 if days_gap <= 7:
                     prev_amt = abs(r_prev["gross_amount"])
                     curr_amt = abs(r_curr["gross_amount"])
-                    is_exact_amount = abs(curr_amt - prev_amt) < 0.01
-
-                    if is_exact_amount:
-                        classification = "CONFIRMED_LOSS"
-                        loss_id = f"LOSS-DUP-REFUND-{o_id}-{r_curr['transaction_id']}"
-                        
-                        if not any(item.economic_loss_id == loss_id for item in economic_loss_ledger):
-                            economic_loss_ledger.append(EconomicLossItem(
-                                economic_loss_id=loss_id,
-                                order_id=o_id,
-                                transaction_id=r_curr["transaction_id"],
-                                rule_id=RULE_DUP_REFUND,
-                                description=f"Proven duplicate refund disbursement of ${curr_amt:,.2f} issued for Order '{o_id}' within {days_gap} day(s).",
-                                proven_loss_amount=curr_amt
-                            ))
-                            proven_loss_tracker[o_id] = proven_loss_tracker.get(o_id, 0.0) + curr_amt
-
-                        desc = f"Proven duplicate refund disbursement of ${curr_amt:,.2f} for Order '{o_id}' (identical amount to previous refund within {days_gap} day(s))."
-                    else:
-                        classification = "REVIEW_REQUIRED"
-                        desc = f"Multiple refunds issued for Order '{o_id}' within {days_gap} day(s) (${prev_amt:,.2f} and ${curr_amt:,.2f}). Review partial refund validity."
-
+                    
                     flag = AnomalyFlag(
                         rule_id=RULE_DUP_REFUND,
                         rule_name=RULE_METADATA[RULE_DUP_REFUND]["name"],
-                        severity="HIGH" if classification == "CONFIRMED_LOSS" else "MEDIUM",
-                        classification=classification,
-                        description=desc,
+                        severity="MEDIUM",
+                        classification="REVIEW_REQUIRED",  # ALWAYS REVIEW_REQUIRED
+                        description=f"Multiple refund events for Order '{o_id}' within {days_gap} day(s) (${prev_amt:,.2f} and ${curr_amt:,.2f}). Review partial refund validity.",
                         amount_at_risk=curr_amt
                     )
                     add_flag_if_missing(r_curr["flags"], flag)
 
-        # RULE 6: REFUND_EXCEEDS_SALE (ECONOMIC LAYER)
+        # RULE 6: REFUND_EXCEEDS_SALE (CONFIRMED_LOSS FROM RECONCILIATION)
         if has_sale and refund_events:
             sale_total = sales_by_order.get(o_id, 0.0)
             total_unique_refunds = sum(abs(e["gross_amount"]) for e in refund_events)
 
             if total_unique_refunds > sale_total + 0.01:
-                total_excess = total_unique_refunds - sale_total
-                already_proven_dup_loss = proven_loss_tracker.get(o_id, 0.0)
-                remaining_excess_loss = max(0.0, total_excess - already_proven_dup_loss)
+                net_excess_loss = total_unique_refunds - sale_total
+                loss_id = f"LOSS-EXCESS-REFUND-{o_id}"
 
-                if remaining_excess_loss > 0.01:
-                    loss_id = f"LOSS-EXCESS-REFUND-{o_id}"
-                    if not any(item.economic_loss_id == loss_id for item in economic_loss_ledger):
-                        economic_loss_ledger.append(EconomicLossItem(
-                            economic_loss_id=loss_id,
-                            order_id=o_id,
-                            transaction_id=refund_events[-1]["transaction_id"],
-                            rule_id=RULE_REFUND_EXCEEDS,
-                            description=f"Net refund excess over original sale price for Order '{o_id}' (${total_unique_refunds:,.2f} unique refunds vs ${sale_total:,.2f} sale).",
-                            proven_loss_amount=round(remaining_excess_loss, 2)
-                        ))
+                if not any(item.economic_loss_id == loss_id for item in economic_loss_ledger):
+                    economic_loss_ledger.append(EconomicLossItem(
+                        economic_loss_id=loss_id,
+                        order_id=o_id,
+                        transaction_id=refund_events[-1]["transaction_id"],
+                        rule_id=RULE_REFUND_EXCEEDS,
+                        description=f"Net refund excess over original sale price for Order '{o_id}' (${total_unique_refunds:,.2f} unique refunds vs ${sale_total:,.2f} sale).",
+                        proven_loss_amount=round(net_excess_loss, 2)
+                    ))
 
                 for r_ev in refund_events:
                     flag = AnomalyFlag(
@@ -244,8 +263,8 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                         rule_name=RULE_METADATA[RULE_REFUND_EXCEEDS]["name"],
                         severity="HIGH",
                         classification="CONFIRMED_LOSS",
-                        description=f"Order '{o_id}' unique refunds (${total_unique_refunds:,.2f}) exceed sale (${sale_total:,.2f}) by ${total_excess:,.2f} net excess.",
-                        amount_at_risk=round(total_excess, 2)
+                        description=f"Order '{o_id}' unique refunds (${total_unique_refunds:,.2f}) exceed sale (${sale_total:,.2f}) by ${net_excess_loss:,.2f} net excess.",
+                        amount_at_risk=round(net_excess_loss, 2)
                     )
                     add_flag_if_missing(r_ev["flags"], flag)
 
