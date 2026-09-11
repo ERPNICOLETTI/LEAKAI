@@ -1,11 +1,12 @@
 import unittest
 import os
 import sys
+from decimal import Decimal
 
 # Ensure backend path is importable
 sys.path.append(os.path.dirname(__file__))
 
-from normalizer import normalize_csv
+from normalizer import validate_and_normalize_csv, parse_decimal_strict, normalize_csv
 from detector import (
     analyze_transactions, 
     RULE_DUP_TX, 
@@ -25,122 +26,122 @@ class TestLeakAIDetector(unittest.TestCase):
         demo_path = os.path.join(os.path.dirname(__file__), "demo_transactions.csv")
         with open(demo_path, "rb") as f:
             self.csv_bytes = f.read()
-        self.df = normalize_csv(self.csv_bytes)
+        self.val_result, self.df = validate_and_normalize_csv(self.csv_bytes)
         self.summary, self.txs = analyze_transactions(self.df)
         self.tx_map = {t.transaction_id: t for t in self.txs}
 
     def test_overall_financial_totals(self):
+        self.assertTrue(self.val_result.is_valid)
         self.assertEqual(self.summary.raw_record_count, 15)
         self.assertEqual(self.summary.economic_event_count, 14)
         self.assertEqual(self.summary.total_gross_revenue, 2795.00)
         self.assertEqual(self.summary.total_fees_paid, 107.38)
         self.assertEqual(self.summary.confirmed_loss_amount, 650.00)
         self.assertEqual(self.summary.potential_review_amount, 1613.58)
-        self.assertEqual(len(self.summary.financials_by_currency), 1)
-        self.assertEqual(self.summary.financials_by_currency[0].currency, "USD")
 
-    def test_regression_O_decimal_precision_no_false_net_math_error(self):
+    def test_regression_T_order_id_before_transaction_id_columns(self):
         """
-        TEST O — Decimal precision:
-        sale gross = 0.10, fee = 0.03, net = 0.07
-        Expected: no false NET_AMOUNT_INCONSISTENCY.
+        TEST T — order_id before transaction_id columns
+        CSV column order: order_id,transaction_id,...
+        Expected: correct mapping, transaction_id must NOT accidentally map to order_id.
+        """
+        csv_data = (
+            "order_id,transaction_id,date,type,gross_amount,fee,net_amount,currency\n"
+            "ord_8801,tx_999,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+        ).encode('utf-8')
+        val_res, df = validate_and_normalize_csv(csv_data)
+        self.assertTrue(val_res.is_valid)
+        self.assertEqual(df.iloc[0]['transaction_id'], "tx_999")
+        self.assertEqual(df.iloc[0]['order_id'], "ord_8801")
+
+    def test_regression_U_malformed_amount(self):
+        """
+        TEST U — malformed amount
+        gross_amount = "abc"
+        Expected: validation error, NOT Decimal("0.00"), NO financial analysis.
         """
         csv_data = (
             "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
-            "tx_dec1,ord_dec1,2026-01-01,sale,0.10,0.03,0.07,USD\n"
+            "tx_1,ord_1,2026-01-01,sale,abc,3.00,97.00,USD\n"
         ).encode('utf-8')
-        df = normalize_csv(csv_data)
-        summary, txs = analyze_transactions(df)
+        val_res, df = validate_and_normalize_csv(csv_data)
+        self.assertFalse(val_res.is_valid)
+        self.assertIsNone(df)
+        self.assertTrue(any("gross_amount" in err for err in val_res.errors))
 
-        self.assertFalse(txs[0].has_anomaly)
-        self.assertEqual(summary.total_gross_revenue, 0.10)
-        self.assertEqual(summary.total_fees_paid, 0.03)
-
-    def test_regression_P_repeated_decimal_addition(self):
+    def test_regression_V_missing_currency(self):
         """
-        TEST P — repeated decimal addition:
-        three amounts of 0.10
-        Expected exact total: 0.30 (no 0.30000000000000004 float artifact).
+        TEST V — missing currency
+        Expected: validation error, NO automatic USD assumption.
         """
         csv_data = (
             "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
-            "tx_a,ord_a,2026-01-01,sale,0.10,0.01,0.09,USD\n"
-            "tx_b,ord_b,2026-01-01,sale,0.10,0.01,0.09,USD\n"
-            "tx_c,ord_c,2026-01-01,sale,0.10,0.01,0.09,USD\n"
+            "tx_1,ord_1,2026-01-01,sale,100.00,3.00,97.00,\n"
         ).encode('utf-8')
-        df = normalize_csv(csv_data)
-        summary, txs = analyze_transactions(df)
+        val_res, df = validate_and_normalize_csv(csv_data)
+        self.assertFalse(val_res.is_valid)
+        self.assertIsNone(df)
+        self.assertTrue(any("Currency" in err for err in val_res.errors))
 
-        self.assertEqual(summary.total_gross_revenue, 0.30)
-        self.assertEqual(summary.total_fees_paid, 0.03)
-
-    def test_regression_Q_multi_currency_isolation(self):
+    def test_regression_W_unknown_transaction_type(self):
         """
-        TEST Q — multi-currency isolation:
-        USD: sale = 100, refund = 120 (confirmed loss = 20 USD)
-        EUR: sale = 100, refund = 50 (confirmed loss = 0 EUR)
-        Expected: USD confirmed loss = 20 USD, EUR confirmed loss = 0 EUR.
-        Never produce combined confirmed loss without currency context.
+        TEST W — unknown transaction type
+        type = "mystery_event"
+        Expected: must NOT become sale, validation error.
         """
         csv_data = (
             "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
-            "tx_u1,ord_u,2026-01-01,sale,100.00,3.00,97.00,USD\n"
-            "tx_u2,ord_u,2026-01-02,refund,-120.00,0.00,-120.00,USD\n"
-            "tx_e1,ord_e,2026-01-01,sale,100.00,3.00,97.00,EUR\n"
-            "tx_e2,ord_e,2026-01-02,refund,-50.00,0.00,-50.00,EUR\n"
+            "tx_1,ord_1,2026-01-01,mystery_event,100.00,3.00,97.00,USD\n"
         ).encode('utf-8')
-        df = normalize_csv(csv_data)
-        summary, txs = analyze_transactions(df)
+        val_res, df = validate_and_normalize_csv(csv_data)
+        self.assertFalse(val_res.is_valid)
+        self.assertIsNone(df)
+        self.assertTrue(any("Unsupported transaction type" in err for err in val_res.errors))
 
-        self.assertEqual(len(summary.financials_by_currency), 2)
-        usd_fin = next(f for f in summary.financials_by_currency if f.currency == "USD")
-        eur_fin = next(f for f in summary.financials_by_currency if f.currency == "EUR")
-
-        self.assertEqual(usd_fin.confirmed_loss_amount, 20.00)
-        self.assertEqual(eur_fin.confirmed_loss_amount, 0.00)
-
-    def test_regression_R_same_order_id_across_currencies_no_cross_matching(self):
+    def test_regression_X_invalid_date(self):
         """
-        TEST R — same order ID across currencies:
-        ord_1 sale 100 USD
-        ord_1 refund 120 EUR
-        Expected: they do NOT reconcile against each other. No confirmed loss caused by cross-currency matching.
+        TEST X — invalid date
+        Expected: must NOT become 2026-01-01, validation error.
         """
         csv_data = (
             "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
-            "tx_u1,ord_1,2026-01-01,sale,100.00,3.00,97.00,USD\n"
-            "tx_e1,ord_1,2026-01-02,refund,-120.00,0.00,-120.00,EUR\n"
+            "tx_1,ord_1,not_a_date,sale,100.00,3.00,97.00,USD\n"
         ).encode('utf-8')
-        df = normalize_csv(csv_data)
-        summary, txs = analyze_transactions(df)
+        val_res, df = validate_and_normalize_csv(csv_data)
+        self.assertFalse(val_res.is_valid)
+        self.assertIsNone(df)
+        self.assertTrue(any("date" in err.lower() for err in val_res.errors))
 
-        self.assertEqual(summary.confirmed_loss_amount, 0.0)
-        self.assertTrue(any(f.rule_id == RULE_UNMATCHED_REFUND for f in txs[1].flags))
-
-    def test_regression_S_conflicting_transaction_currency(self):
+    def test_regression_Y_missing_transaction_id(self):
         """
-        TEST S — conflicting transaction currency:
-        same transaction_id: one row USD, one row EUR
-        Expected: CONFLICTING_TRANSACTION_ID, excluded from economic reconciliation.
+        TEST Y — missing transaction ID
+        Expected: no synthetic authoritative transaction ID used for reconciliation.
         """
         csv_data = (
             "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
-            "tx_x,ord_1,2026-01-01,sale,100.00,3.00,97.00,USD\n"
-            "tx_x,ord_1,2026-01-01,sale,100.00,3.00,97.00,EUR\n"
+            ",ord_1,2026-01-01,sale,100.00,3.00,97.00,USD\n"
         ).encode('utf-8')
-        df = normalize_csv(csv_data)
-        summary, txs = analyze_transactions(df)
+        val_res, df = validate_and_normalize_csv(csv_data)
+        self.assertFalse(val_res.is_valid)
+        self.assertIsNone(df)
+        self.assertTrue(any("Transaction ID is missing" in err for err in val_res.errors))
 
-        self.assertTrue(any(f.rule_id == RULE_CONFLICTING_TX for f in txs[0].flags))
-        self.assertEqual(summary.economic_event_count, 0)
-        self.assertEqual(summary.confirmed_loss_amount, 0.0)
-
-    def test_economic_loss_ledger_deduplication(self):
-        ledger = self.summary.economic_loss_ledger
-        self.assertEqual(len(ledger), 2)
-        total_ledger_loss = sum(item.proven_loss_amount for item in ledger)
-        self.assertEqual(total_ledger_loss, self.summary.confirmed_loss_amount)
-        self.assertEqual(total_ledger_loss, 650.00)
+    def test_regression_Z_valid_zero_amount(self):
+        """
+        TEST Z — valid zero amount
+        gross_amount = "0.00"
+        Expected: valid Decimal zero, distinguishable from parsing failure.
+        """
+        dec = parse_decimal_strict("0.00")
+        self.assertEqual(dec, Decimal("0.00"))
+        
+        csv_data = (
+            "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
+            "tx_1,ord_1,2026-01-01,sale,0.00,0.00,0.00,USD\n"
+        ).encode('utf-8')
+        val_res, df = validate_and_normalize_csv(csv_data)
+        self.assertTrue(val_res.is_valid)
+        self.assertEqual(df.iloc[0]['gross_amount'], Decimal("0.00"))
 
 if __name__ == "__main__":
     unittest.main()

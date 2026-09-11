@@ -1,6 +1,27 @@
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 
+class SchemaMappingResult(BaseModel):
+    source_columns: List[str] = Field(default_factory=list)
+    mapped_fields: Dict[str, str] = Field(default_factory=dict)
+    missing_required_fields: List[str] = Field(default_factory=list)
+    ambiguous_fields: Dict[str, List[str]] = Field(default_factory=dict)
+    unused_columns: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+class FileValidationResult(BaseModel):
+    is_valid: bool
+    errors: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    detected_columns: List[str] = Field(default_factory=list)
+    mapped_columns: Dict[str, str] = Field(default_factory=dict)
+    row_error_count: int = 0
+    valid_row_count: int = 0
+
+class ValidationBlockedResponse(BaseModel):
+    status: str = "Analysis blocked: input validation failed."
+    validation: FileValidationResult
+
 class AnomalyFlag(BaseModel):
     rule_id: str
     rule_name: str
@@ -80,3 +101,4 @@ class AnalysisResponse(BaseModel):
     transactions: List[TransactionRecord]
     filename: str
     processed_at: str
+    validation: Optional[FileValidationResult] = None
