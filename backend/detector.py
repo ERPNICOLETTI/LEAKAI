@@ -99,16 +99,27 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
     # REVIEW ISSUE LEDGER INITIALIZATION
     review_issue_ledger: List[ReviewIssueItem] = []
 
-    def add_review_issue(issue_id: str, rule_id: str, desc: str, amount: float, order_id: Optional[str] = None, tx_id: Optional[str] = None, affected_rows: List[str] = []):
+    def add_review_issue(
+        issue_id: str, 
+        rule_id: str, 
+        desc: str, 
+        amount: float, 
+        order_id: Optional[str] = None, 
+        tx_id: Optional[str] = None, 
+        exposure_key: Optional[str] = None,
+        affected_rows: Optional[List[str]] = None
+    ):
+        rows_list = affected_rows if affected_rows is not None else []
         if not any(item.review_issue_id == issue_id for item in review_issue_ledger):
             review_issue_ledger.append(ReviewIssueItem(
                 review_issue_id=issue_id,
                 rule_id=rule_id,
                 order_id=order_id,
                 transaction_id=tx_id,
+                exposure_key=exposure_key,
                 description=desc,
                 amount_requiring_review=round(max(0.0, amount), 2),
-                affected_raw_rows=affected_rows
+                affected_raw_rows=rows_list
             ))
 
     # RAW LAYER CHECK: DUPLICATE & CONFLICTING TRANSACTION IDs
@@ -149,6 +160,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 desc=desc,
                 amount=conflict_amount,
                 tx_id=t_id,
+                exposure_key=f"EXPOSURE-TX-{t_id}",
                 affected_rows=affected_row_ids
             )
 
@@ -164,7 +176,6 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 )
                 add_flag_if_missing(rec["flags"], flag)
         else:
-            # Identical duplicate raw rows -> Create AT MOST ONE unique review issue per transaction ID
             dup_amount = abs(first_rec["gross_amount"])
             desc = f"Transaction ID '{t_id}' appears {len(indices)} times in raw export. Review export to verify if gateway double-settled."
             
@@ -174,6 +185,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 desc=desc,
                 amount=dup_amount,
                 tx_id=t_id,
+                exposure_key=f"EXPOSURE-TX-{t_id}",
                 affected_rows=affected_row_ids
             )
 
@@ -242,6 +254,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                     amount=abs(ev["gross_amount"]),
                     order_id=o_id,
                     tx_id=ev["transaction_id"],
+                    exposure_key=f"EXPOSURE-UNMATCHED-{ev['transaction_id']}",
                     affected_rows=[str(ev["index"])]
                 )
                 flag = AnomalyFlag(
@@ -256,6 +269,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
 
     # ORDER-LEVEL MONETARY RECONCILIATION & ECONOMIC LOSS LEDGER
     economic_loss_ledger: List[EconomicLossItem] = []
+    order_confirmed_loss_map: Dict[str, float] = {}
 
     for o_id, events in econ_order_map.items():
         refund_events = [e for e in events if e["type"] == "refund"]
@@ -284,6 +298,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                         amount=curr_amt,
                         order_id=o_id,
                         tx_id=r_curr["transaction_id"],
+                        exposure_key=f"EXPOSURE-ORDER-REFUND-{o_id}",
                         affected_rows=[str(r_prev["index"]), str(r_curr["index"])]
                     )
 
@@ -315,6 +330,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                         description=f"Net refund excess over original sale price for Order '{o_id}' (${total_unique_refunds:,.2f} unique refunds vs ${sale_total:,.2f} sale).",
                         proven_loss_amount=round(net_excess_loss, 2)
                     ))
+                    order_confirmed_loss_map[o_id] = round(net_excess_loss, 2)
 
                 for r_ev in refund_events:
                     flag = AnomalyFlag(
@@ -345,6 +361,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 desc=desc,
                 amount=0.0,
                 tx_id=t_id,
+                exposure_key=None,
                 affected_rows=[str(rec["index"])]
             )
             flag = AnomalyFlag(
@@ -369,6 +386,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 amount=diff,
                 order_id=o_id,
                 tx_id=t_id,
+                exposure_key=f"EXPOSURE-TX-{t_id}",
                 affected_rows=[str(rec["index"])]
             )
             flag = AnomalyFlag(
@@ -395,6 +413,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                     amount=round(excess_fee, 2),
                     order_id=o_id,
                     tx_id=t_id,
+                    exposure_key=f"EXPOSURE-TX-{t_id}",
                     affected_rows=[str(rec["index"])]
                 )
                 flag = AnomalyFlag(
@@ -417,6 +436,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 amount=abs(fee),
                 order_id=o_id,
                 tx_id=t_id,
+                exposure_key=f"EXPOSURE-TX-{t_id}",
                 affected_rows=[str(rec["index"])]
             )
             flag = AnomalyFlag(
@@ -440,7 +460,30 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
     high_severity_count = 0
 
     confirmed_loss_amount = round(sum(item.proven_loss_amount for item in economic_loss_ledger), 2)
-    potential_review_amount = round(sum(item.amount_requiring_review for item in review_issue_ledger), 2)
+
+    # -------------------------------------------------------------------------
+    # 4. REVIEW EXPOSURE AGGREGATION: Group by exposure_key (MAX per key)
+    #    Subtract any proven confirmed loss already accounted for in that pool
+    # -------------------------------------------------------------------------
+    exposure_groups: Dict[str, float] = {}
+    for item in review_issue_ledger:
+        e_key = item.exposure_key
+        if not e_key:
+            continue
+        exposure_groups[e_key] = max(exposure_groups.get(e_key, 0.0), item.amount_requiring_review)
+
+    potential_review_amount = 0.0
+    for e_key, gross_exposure in exposure_groups.items():
+        already_proven = 0.0
+        # If this exposure key is associated with an order refund pool, subtract proven loss for that order
+        if e_key.startswith("EXPOSURE-ORDER-REFUND-"):
+            o_id = e_key.replace("EXPOSURE-ORDER-REFUND-", "")
+            already_proven = order_confirmed_loss_map.get(o_id, 0.0)
+
+        unproven_exposure = max(0.0, gross_exposure - already_proven)
+        potential_review_amount += unproven_exposure
+
+    potential_review_amount = round(potential_review_amount, 2)
 
     type_risk_map: Dict[str, float] = {}
     type_count_map: Dict[str, int] = {}

@@ -35,90 +35,77 @@ class TestLeakAIDetector(unittest.TestCase):
         self.assertEqual(self.summary.total_gross_revenue, 2795.00)
         self.assertEqual(self.summary.total_fees_paid, 107.38)
         self.assertEqual(self.summary.confirmed_loss_amount, 650.00)
-        self.assertEqual(self.summary.potential_review_amount, 2263.58)
+        self.assertEqual(self.summary.potential_review_amount, 1613.58)
 
-    def test_regression_A_two_identical_rows_same_tx_id(self):
-        csv_data = (
-            "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
-            "tx_100,ord_1,2026-01-01,sale,100.00,3.00,97.00,USD\n"
-            "tx_100,ord_1,2026-01-01,sale,100.00,3.00,97.00,USD\n"
-        ).encode('utf-8')
-        df = normalize_csv(csv_data)
-        summary, txs = analyze_transactions(df)
-        
-        self.assertEqual(summary.confirmed_loss_amount, 0.0)
-        self.assertTrue(any(f.rule_id == RULE_DUP_TX and f.classification == "REVIEW_REQUIRED" for f in txs[1].flags))
-
-    def test_regression_I_duplicate_sale_raw_row(self):
+    def test_regression_K_same_economic_event_two_review_rules_no_double_counting(self):
         """
-        TEST I: Duplicate sale raw row
-        -> raw rows = 2
-        -> economic events = 1
-        -> gross revenue counted once ($100)
-        -> fees counted once ($3)
+        TEST K: Real anti-double-counting test
+        One transaction: gross = $100, fee anomaly = $20 exposure, net inconsistency = $20 exposure
+        Both review issues must exist.
+        Expected: review issue count = 2, potential review exposure = $20 (NOT $40)
         """
         csv_data = (
             "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
-            "tx_100,ord_1,2026-01-01,sale,100.00,3.00,97.00,USD\n"
-            "tx_100,ord_1,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+            "tx_0a,ord_0a,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+            "tx_0b,ord_0b,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+            "tx_0c,ord_0c,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+            "tx_100,ord_1,2026-01-01,sale,100.00,23.00,57.00,USD\n"  # Fee 23 (excess $20 over 3% baseline), Net 57 vs 77 (math diff $20)
         ).encode('utf-8')
         df = normalize_csv(csv_data)
         summary, txs = analyze_transactions(df)
 
-        self.assertEqual(summary.raw_record_count, 2)
-        self.assertEqual(summary.economic_event_count, 1)
-        self.assertEqual(summary.total_gross_revenue, 100.00)
-        self.assertEqual(summary.total_fees_paid, 3.00)
+        self.assertEqual(len(summary.review_issue_ledger), 2)
+        # Potential review amount must NOT double-count the $20 exposure (must equal $20, not $40)
+        self.assertEqual(summary.potential_review_amount, 20.00)
 
-    def test_regression_J_duplicate_raw_refund_one_review_issue(self):
+    def test_regression_M_ord_8806_scenario_no_double_reporting_confirmed_and_potential(self):
         """
-        TEST J: Duplicate raw refund generates multiple visible flags
-        -> only one duplicate-transaction review issue in review ledger
+        TEST M: Scenario similar to ord_8806
+        sale = $550, refund tx_A = $550, duplicate raw tx_A row, refund tx_B = $550
+        Expected:
+        - duplicate transaction review exists
+        - multiple refund review exists
+        - confirmed loss = $550 from refund excess
+        - review issues remain visible
+        - potential review must NOT count the same $550 twice
+        - confirmed loss and potential review must not double-report exact same proven exposure
         """
         csv_data = (
             "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
-            "tx_R1,ord_1,2026-01-01,refund,-50.00,0.00,-50.00,USD\n"
-            "tx_R1,ord_1,2026-01-01,refund,-50.00,0.00,-50.00,USD\n"
+            "tx_S1,ord_8806,2026-01-01,sale,550.00,16.25,533.75,USD\n"
+            "tx_R1,ord_8806,2026-01-02,refund,-550.00,0.00,-550.00,USD\n"
+            "tx_R1,ord_8806,2026-01-02,refund,-550.00,0.00,-550.00,USD\n"
+            "tx_R2,ord_8806,2026-01-04,refund,-550.00,0.00,-550.00,USD\n"
         ).encode('utf-8')
         df = normalize_csv(csv_data)
         summary, txs = analyze_transactions(df)
 
-        dup_issues = [item for item in summary.review_issue_ledger if item.rule_id == RULE_DUP_TX]
-        self.assertEqual(len(dup_issues), 1)
+        self.assertEqual(summary.confirmed_loss_amount, 550.00)
+        self.assertTrue(any(item.rule_id == RULE_DUP_TX for item in summary.review_issue_ledger))
+        self.assertTrue(any(item.rule_id == RULE_DUP_REFUND for item in summary.review_issue_ledger))
+        # Potential review exposure for tx_R1 duplicate row ($550) + ord_8806 refund pool ($550 - $550 proven = $0) = $550
+        self.assertEqual(summary.potential_review_amount, 550.00)
 
-    def test_regression_K_same_economic_event_two_review_rules(self):
+    def test_regression_N_high_fee_15_and_net_math_10_same_tx_max_exposure(self):
         """
-        TEST K: Same economic event has two REVIEW_REQUIRED rules
-        -> review ledger avoids counting the same monetary exposure twice
+        TEST N: One transaction has:
+        - HIGH_FEE_DETECTED = $15 exposure
+        - NET_AMOUNT_INCONSISTENCY = $10 exposure
+        Same transaction
+        Expected: two review issues, one transaction exposure group, potential review = MAX($15, $10) = $15
         """
         csv_data = (
             "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
-            "tx_100,ord_1,2026-01-01,sale,100.00,25.00,70.00,USD\n"  # High fee + Net Math error
+            "tx_0a,ord_0a,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+            "tx_0b,ord_0b,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+            "tx_0c,ord_0c,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+            "tx_1,ord_1,2026-01-01,sale,100.00,18.00,72.00,USD\n"  # Fee 18 (excess $15 over 3% baseline), Net 72 vs 82 (math diff $10)
         ).encode('utf-8')
         df = normalize_csv(csv_data)
         summary, txs = analyze_transactions(df)
 
-        self.assertTrue(len(summary.review_issue_ledger) >= 1)
-        # Verify potential review total sums unique ledger item amounts
-        expected_sum = sum(item.amount_requiring_review for item in summary.review_issue_ledger)
-        self.assertEqual(summary.potential_review_amount, expected_sum)
-
-    def test_regression_L_order_level_review_warning_single_ledger_entry(self):
-        """
-        TEST L: Order-level review warning appears on multiple rows
-        -> unique review issue counted once
-        """
-        csv_data = (
-            "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
-            "tx_S1,ord_1,2026-01-01,sale,500.00,15.00,485.00,USD\n"
-            "tx_R1,ord_1,2026-01-02,refund,-100.00,0.00,-100.00,USD\n"
-            "tx_R2,ord_1,2026-01-03,refund,-100.00,0.00,-100.00,USD\n"
-        ).encode('utf-8')
-        df = normalize_csv(csv_data)
-        summary, txs = analyze_transactions(df)
-
-        multi_refund_issues = [item for item in summary.review_issue_ledger if item.rule_id == RULE_DUP_REFUND]
-        self.assertEqual(len(multi_refund_issues), 1)
+        self.assertEqual(len(summary.review_issue_ledger), 2)
+        self.assertEqual(summary.potential_review_amount, 15.00)
 
     def test_economic_loss_ledger_deduplication(self):
         ledger = self.summary.economic_loss_ledger

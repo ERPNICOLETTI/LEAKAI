@@ -22,6 +22,7 @@ class ReviewIssueItem(BaseModel):
     rule_id: str
     order_id: Optional[str] = None
     transaction_id: Optional[str] = None
+    exposure_key: Optional[str] = None
     description: str
     amount_requiring_review: float
     affected_raw_rows: List[str] = []
