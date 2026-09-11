@@ -1,5 +1,5 @@
 import React from 'react';
-import { DollarSign, ShieldAlert, AlertTriangle, CreditCard } from 'lucide-react';
+import { DollarSign, ShieldAlert, AlertTriangle, CreditCard, Layers } from 'lucide-react';
 
 export default function SummaryCards({ summary }) {
   if (!summary) return null;
@@ -7,6 +7,9 @@ export default function SummaryCards({ summary }) {
   const formatCurrency = (val) => {
     return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val);
   };
+
+  const reviewIssueCount = summary.review_issue_ledger ? summary.review_issue_ledger.length : 0;
+  const economicLossCount = summary.economic_loss_ledger ? summary.economic_loss_ledger.length : 0;
 
   return (
     <div className="metrics-grid">
@@ -20,7 +23,7 @@ export default function SummaryCards({ summary }) {
           {formatCurrency(summary.confirmed_loss_amount)}
         </div>
         <div className="metric-sub">
-          {summary.economic_loss_ledger ? summary.economic_loss_ledger.length : 0} proven economic loss entries in ledger
+          {economicLossCount} proven economic loss entries in ledger
         </div>
       </div>
 
@@ -34,11 +37,11 @@ export default function SummaryCards({ summary }) {
           {formatCurrency(summary.potential_review_amount)}
         </div>
         <div className="metric-sub">
-          Not money lost • Data quality & gateway variance
+          {reviewIssueCount} unique review issue ledger items
         </div>
       </div>
 
-      {/* TOTAL GROSS REVENUE */}
+      {/* GROSS REVENUE ANALYZED */}
       <div className="metric-card">
         <div className="metric-header">
           <span>GROSS REVENUE ANALYZED</span>
@@ -48,21 +51,21 @@ export default function SummaryCards({ summary }) {
           {formatCurrency(summary.total_gross_revenue)}
         </div>
         <div className="metric-sub">
-          Across {summary.total_transactions} gateway records
+          Across {summary.economic_event_count} unique economic events ({summary.raw_record_count} raw rows)
         </div>
       </div>
 
-      {/* TOTAL PROCESSING FEES */}
+      {/* FEES ANALYZED */}
       <div className="metric-card">
         <div className="metric-header">
-          <span>GATEWAY FEES PAID</span>
+          <span>FEES ANALYZED</span>
           <CreditCard size={20} color="#8b5cf6" />
         </div>
         <div className="metric-value">
           {formatCurrency(summary.total_fees_paid)}
         </div>
         <div className="metric-sub">
-          {summary.total_anomalous_transactions} total flagged records ({summary.high_severity_count} High)
+          {summary.total_anomalous_transactions} flagged raw records ({summary.high_severity_count} High)
         </div>
       </div>
     </div>

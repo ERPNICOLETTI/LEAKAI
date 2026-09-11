@@ -2,9 +2,9 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Tuple, Optional
 try:
-    from models import TransactionRecord, AnomalyFlag, AuditSummary, CategoryRisk, RuleBreakdown, EconomicLossItem
+    from models import TransactionRecord, AnomalyFlag, AuditSummary, CategoryRisk, RuleBreakdown, EconomicLossItem, ReviewIssueItem
 except ImportError:
-    from .models import TransactionRecord, AnomalyFlag, AuditSummary, CategoryRisk, RuleBreakdown, EconomicLossItem
+    from .models import TransactionRecord, AnomalyFlag, AuditSummary, CategoryRisk, RuleBreakdown, EconomicLossItem, ReviewIssueItem
 
 RULE_DUP_TX = "DUPLICATE_TRANSACTION_ID"
 RULE_CONFLICTING_TX = "CONFLICTING_TRANSACTION_ID"
@@ -96,6 +96,21 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
             "raw_data": row['raw_data']
         })
 
+    # REVIEW ISSUE LEDGER INITIALIZATION
+    review_issue_ledger: List[ReviewIssueItem] = []
+
+    def add_review_issue(issue_id: str, rule_id: str, desc: str, amount: float, order_id: Optional[str] = None, tx_id: Optional[str] = None, affected_rows: List[str] = []):
+        if not any(item.review_issue_id == issue_id for item in review_issue_ledger):
+            review_issue_ledger.append(ReviewIssueItem(
+                review_issue_id=issue_id,
+                rule_id=rule_id,
+                order_id=order_id,
+                transaction_id=tx_id,
+                description=desc,
+                amount_requiring_review=round(max(0.0, amount), 2),
+                affected_raw_rows=affected_rows
+            ))
+
     # RAW LAYER CHECK: DUPLICATE & CONFLICTING TRANSACTION IDs
     tx_id_raw_groups: Dict[str, List[int]] = {}
     for i, r in enumerate(raw_records):
@@ -107,7 +122,6 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
         if not t_id or len(indices) <= 1:
             continue
 
-        # Check if financial/metadata fields differ across rows sharing same transaction_id
         first_rec = raw_records[indices[0]]
         has_conflict = False
 
@@ -122,8 +136,22 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 has_conflict = True
                 break
 
+        affected_row_ids = [str(raw_records[i]["index"]) for i in indices]
+
         if has_conflict:
             conflicting_tx_ids.add(t_id)
+            conflict_amount = max(abs(raw_records[i]["gross_amount"]) for i in indices)
+            desc = f"Transaction ID '{t_id}' has conflicting monetary/metadata fields across {len(indices)} raw rows. Excluded from confirmed loss."
+            
+            add_review_issue(
+                issue_id=f"REVIEW-CONFLICTING-TX-{t_id}",
+                rule_id=RULE_CONFLICTING_TX,
+                desc=desc,
+                amount=conflict_amount,
+                tx_id=t_id,
+                affected_rows=affected_row_ids
+            )
+
             for idx in indices:
                 rec = raw_records[idx]
                 flag = AnomalyFlag(
@@ -131,12 +159,24 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                     rule_name=RULE_METADATA[RULE_CONFLICTING_TX]["name"],
                     severity="HIGH",
                     classification="REVIEW_REQUIRED",
-                    description=f"Transaction ID '{t_id}' has conflicting monetary or metadata fields across raw rows. Excluded from confirmed loss reconciliation.",
+                    description=desc,
                     amount_at_risk=abs(rec["gross_amount"])
                 )
                 add_flag_if_missing(rec["flags"], flag)
         else:
-            # Identical duplicate raw rows
+            # Identical duplicate raw rows -> Create AT MOST ONE unique review issue per transaction ID
+            dup_amount = abs(first_rec["gross_amount"])
+            desc = f"Transaction ID '{t_id}' appears {len(indices)} times in raw export. Review export to verify if gateway double-settled."
+            
+            add_review_issue(
+                issue_id=f"REVIEW-DUP-TX-{t_id}",
+                rule_id=RULE_DUP_TX,
+                desc=desc,
+                amount=dup_amount,
+                tx_id=t_id,
+                affected_rows=affected_row_ids
+            )
+
             for idx in indices[1:]:
                 rec = raw_records[idx]
                 flag = AnomalyFlag(
@@ -144,8 +184,8 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                     rule_name=RULE_METADATA[RULE_DUP_TX]["name"],
                     severity="MEDIUM",
                     classification="REVIEW_REQUIRED",
-                    description=f"Transaction ID '{t_id}' appears multiple times in raw export. Review export to verify if gateway double-settled.",
-                    amount_at_risk=abs(rec["gross_amount"])
+                    description=desc,
+                    amount_at_risk=dup_amount
                 )
                 add_flag_if_missing(rec["flags"], flag)
 
@@ -157,17 +197,15 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
 
     for r in raw_records:
         t_id = r["transaction_id"]
-        # Exclude conflicting transaction IDs from economic event reconciliation
         if t_id and t_id in conflicting_tx_ids:
             continue
-        # Deduplicate identical transaction IDs (keep first occurrence)
         if t_id and t_id in seen_tx_ids:
             continue
         if t_id:
             seen_tx_ids.add(t_id)
         economic_events.append(r)
 
-    # DYNAMIC MEDIAN FEE BASELINE CALCULATION FROM DEDUPLICATED ECONOMIC SALES
+    # DYNAMIC MEDIAN FEE BASELINE CALCULATION STRICTLY FROM DEDUPLICATED ECONOMIC SALES
     sale_fee_percentages = [
         (ev["fee"] / ev["gross_amount"]) * 100.0
         for ev in economic_events
@@ -196,12 +234,22 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 has_sale = any(e["type"] == "sale" for e in econ_order_map[o_id])
             
             if not has_sale:
+                desc = f"{ev['type'].upper()} of ${abs(ev['gross_amount']):,.2f} has no matching sale in dataset (may exist in prior statement)."
+                add_review_issue(
+                    issue_id=f"REVIEW-UNMATCHED-{ev['transaction_id']}",
+                    rule_id=RULE_UNMATCHED_REFUND,
+                    desc=desc,
+                    amount=abs(ev["gross_amount"]),
+                    order_id=o_id,
+                    tx_id=ev["transaction_id"],
+                    affected_rows=[str(ev["index"])]
+                )
                 flag = AnomalyFlag(
                     rule_id=RULE_UNMATCHED_REFUND,
                     rule_name=RULE_METADATA[RULE_UNMATCHED_REFUND]["name"],
                     severity="MEDIUM",
                     classification="REVIEW_REQUIRED",
-                    description=f"{ev['type'].upper()} of ${abs(ev['gross_amount']):,.2f} has no matching sale in dataset (may exist in prior statement).",
+                    description=desc,
                     amount_at_risk=abs(ev["gross_amount"])
                 )
                 add_flag_if_missing(ev["flags"], flag)
@@ -227,13 +275,24 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 if days_gap <= 7:
                     prev_amt = abs(r_prev["gross_amount"])
                     curr_amt = abs(r_curr["gross_amount"])
+                    desc = f"Multiple refund events for Order '{o_id}' within {days_gap} day(s) (${prev_amt:,.2f} and ${curr_amt:,.2f}). Review partial refund validity."
                     
+                    add_review_issue(
+                        issue_id=f"REVIEW-MULTI-REFUND-{o_id}",
+                        rule_id=RULE_DUP_REFUND,
+                        desc=desc,
+                        amount=curr_amt,
+                        order_id=o_id,
+                        tx_id=r_curr["transaction_id"],
+                        affected_rows=[str(r_prev["index"]), str(r_curr["index"])]
+                    )
+
                     flag = AnomalyFlag(
                         rule_id=RULE_DUP_REFUND,
                         rule_name=RULE_METADATA[RULE_DUP_REFUND]["name"],
                         severity="MEDIUM",
-                        classification="REVIEW_REQUIRED",  # ALWAYS REVIEW_REQUIRED
-                        description=f"Multiple refund events for Order '{o_id}' within {days_gap} day(s) (${prev_amt:,.2f} and ${curr_amt:,.2f}). Review partial refund validity.",
+                        classification="REVIEW_REQUIRED",
+                        description=desc,
                         amount_at_risk=curr_amt
                     )
                     add_flag_if_missing(r_curr["flags"], flag)
@@ -275,15 +334,25 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
         net = rec["net_amount"]
         t_type = rec["type"]
         o_id = rec["order_id"]
+        t_id = rec["transaction_id"]
 
         # RULE 3: MISSING_ORDER_ID (REVIEW_REQUIRED)
         if not o_id and t_type in ["sale", "refund", "chargeback"]:
+            desc = f"Transaction of type '{t_type.upper()}' is missing order reference metadata."
+            add_review_issue(
+                issue_id=f"REVIEW-MISSING-ORDER-{t_id}",
+                rule_id=RULE_MISSING_ORDER,
+                desc=desc,
+                amount=0.0,
+                tx_id=t_id,
+                affected_rows=[str(rec["index"])]
+            )
             flag = AnomalyFlag(
                 rule_id=RULE_MISSING_ORDER,
                 rule_name=RULE_METADATA[RULE_MISSING_ORDER]["name"],
                 severity="LOW",
                 classification="REVIEW_REQUIRED",
-                description=f"Transaction of type '{t_type.upper()}' is missing order reference metadata.",
+                description=desc,
                 amount_at_risk=0.0
             )
             add_flag_if_missing(rec["flags"], flag)
@@ -292,12 +361,22 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
         expected_net = gross - fee
         if abs(net - expected_net) > 0.01:
             diff = round(abs(net - expected_net), 2)
+            desc = f"Net settlement variance: Net (${net:,.2f}) != Gross (${gross:,.2f}) - Fee (${fee:,.2f}) [Variance: ${diff:,.2f}]. Review gateway accounting log."
+            add_review_issue(
+                issue_id=f"REVIEW-NET-MATH-{t_id}",
+                rule_id=RULE_NET_MATH,
+                desc=desc,
+                amount=diff,
+                order_id=o_id,
+                tx_id=t_id,
+                affected_rows=[str(rec["index"])]
+            )
             flag = AnomalyFlag(
                 rule_id=RULE_NET_MATH,
                 rule_name=RULE_METADATA[RULE_NET_MATH]["name"],
                 severity="MEDIUM",
                 classification="REVIEW_REQUIRED",
-                description=f"Net settlement variance: Net (${net:,.2f}) != Gross (${gross:,.2f}) - Fee (${fee:,.2f}) [Variance: ${diff:,.2f}]. Review gateway accounting log.",
+                description=desc,
                 amount_at_risk=diff
             )
             add_flag_if_missing(rec["flags"], flag)
@@ -308,65 +387,72 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
             if fee_pct > fee_threshold_pct:
                 normal_fee = gross * (median_fee_pct / 100.0)
                 excess_fee = fee - normal_fee
+                desc = f"Gateway processing fee of ${fee:,.2f} ({fee_pct:.1f}%) is materially above dataset median sale baseline ({median_fee_pct:.1f}%). Excess: ${excess_fee:,.2f}."
+                add_review_issue(
+                    issue_id=f"REVIEW-HIGH-FEE-{t_id}",
+                    rule_id=RULE_HIGH_FEE,
+                    desc=desc,
+                    amount=round(excess_fee, 2),
+                    order_id=o_id,
+                    tx_id=t_id,
+                    affected_rows=[str(rec["index"])]
+                )
                 flag = AnomalyFlag(
                     rule_id=RULE_HIGH_FEE,
                     rule_name=RULE_METADATA[RULE_HIGH_FEE]["name"],
                     severity="LOW",
                     classification="REVIEW_REQUIRED",
-                    description=f"Gateway processing fee of ${fee:,.2f} ({fee_pct:.1f}%) is materially above dataset median sale baseline ({median_fee_pct:.1f}%). Excess: ${excess_fee:,.2f}.",
+                    description=desc,
                     amount_at_risk=round(excess_fee, 2)
                 )
                 add_flag_if_missing(rec["flags"], flag)
 
         # RULE 8: INVALID_NEGATIVE_FEE (REVIEW_REQUIRED)
         if fee < 0:
+            desc = f"Transaction contains invalid negative fee of ${fee:,.2f}. Review gateway fee credit adjustment."
+            add_review_issue(
+                issue_id=f"REVIEW-NEG-FEE-{t_id}",
+                rule_id=RULE_NEG_FEE,
+                desc=desc,
+                amount=abs(fee),
+                order_id=o_id,
+                tx_id=t_id,
+                affected_rows=[str(rec["index"])]
+            )
             flag = AnomalyFlag(
                 rule_id=RULE_NEG_FEE,
                 rule_name=RULE_METADATA[RULE_NEG_FEE]["name"],
                 severity="LOW",
                 classification="REVIEW_REQUIRED",
-                description=f"Transaction contains invalid negative fee of ${fee:,.2f}. Review gateway fee credit adjustment.",
+                description=desc,
                 amount_at_risk=abs(fee)
             )
             add_flag_if_missing(rec["flags"], flag)
 
-    # SUMMARIZE AUDIT METRICS FOR ALL RAW RECORDS & ECONOMIC LEDGER
+    # -------------------------------------------------------------------------
+    # 3. FINANCIAL TOTALS: Calculated STRICTLY from ECONOMIC EVENTS ONLY
+    # -------------------------------------------------------------------------
+    total_gross_revenue = sum(ev["gross_amount"] for ev in economic_events if ev["type"] == "sale")
+    total_fees_paid = sum(ev["fee"] for ev in economic_events)
+
     tx_list: List[TransactionRecord] = []
-    total_gross_revenue = 0.0
-    total_fees_paid = 0.0
     anomalous_tx_ids = set()
-
-    # Confirmed loss is STRICTLY the sum of unique Economic Loss Ledger items
-    confirmed_loss_amount = round(sum(item.proven_loss_amount for item in economic_loss_ledger), 2)
-
-    potential_review_amount = 0.0
     high_severity_count = 0
+
+    confirmed_loss_amount = round(sum(item.proven_loss_amount for item in economic_loss_ledger), 2)
+    potential_review_amount = round(sum(item.amount_requiring_review for item in review_issue_ledger), 2)
 
     type_risk_map: Dict[str, float] = {}
     type_count_map: Dict[str, int] = {}
-
     rule_risk_map: Dict[str, float] = {r: 0.0 for r in RULE_METADATA}
     rule_count_map: Dict[str, int] = {r: 0 for r in RULE_METADATA}
 
     for rec in raw_records:
-        gross = rec["gross_amount"]
-        fee = rec["fee"]
-
-        if rec["type"] == "sale":
-            total_gross_revenue += gross
-        total_fees_paid += fee
-
         flags = rec["flags"]
         has_anomaly = len(flags) > 0
 
         if has_anomaly:
             anomalous_tx_ids.add(rec["transaction_id"])
-
-            review_flags = [f for f in flags if f.classification == "REVIEW_REQUIRED"]
-            if review_flags:
-                rev_max = max(f.amount_at_risk for f in review_flags)
-                potential_review_amount += rev_max
-
             t_type = rec["type"]
             max_risk_for_tx = max(f.amount_at_risk for f in flags)
             type_risk_map[t_type] = type_risk_map.get(t_type, 0.0) + max_risk_for_tx
@@ -383,8 +469,8 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
             order_id=rec["order_id"],
             date=rec["date"],
             type=rec["type"],
-            gross_amount=gross,
-            fee=fee,
+            gross_amount=rec["gross_amount"],
+            fee=rec["fee"],
             net_amount=rec["net_amount"],
             currency=rec["currency"],
             flags=flags,
@@ -411,14 +497,17 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
     risk_by_rule.sort(key=lambda x: x.risk_amount, reverse=True)
 
     summary = AuditSummary(
-        total_transactions=len(df),
+        raw_record_count=len(raw_records),
+        economic_event_count=len(economic_events),
+        total_transactions=len(raw_records),
         total_gross_revenue=round(total_gross_revenue, 2),
         total_fees_paid=round(total_fees_paid, 2),
         total_anomalous_transactions=len(anomalous_tx_ids),
         confirmed_loss_amount=confirmed_loss_amount,
-        potential_review_amount=round(potential_review_amount, 2),
+        potential_review_amount=potential_review_amount,
         high_severity_count=high_severity_count,
         economic_loss_ledger=economic_loss_ledger,
+        review_issue_ledger=review_issue_ledger,
         risk_by_type=risk_by_type,
         risk_by_rule=risk_by_rule
     )

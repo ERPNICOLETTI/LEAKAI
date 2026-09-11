@@ -17,6 +17,15 @@ class EconomicLossItem(BaseModel):
     description: str
     proven_loss_amount: float
 
+class ReviewIssueItem(BaseModel):
+    review_issue_id: str
+    rule_id: str
+    order_id: Optional[str] = None
+    transaction_id: Optional[str] = None
+    description: str
+    amount_requiring_review: float
+    affected_raw_rows: List[str] = []
+
 class TransactionRecord(BaseModel):
     transaction_id: str
     order_id: Optional[str] = None
@@ -43,6 +52,8 @@ class RuleBreakdown(BaseModel):
     risk_amount: float
 
 class AuditSummary(BaseModel):
+    raw_record_count: int
+    economic_event_count: int
     total_transactions: int
     total_gross_revenue: float
     total_fees_paid: float
@@ -51,6 +62,7 @@ class AuditSummary(BaseModel):
     potential_review_amount: float
     high_severity_count: int
     economic_loss_ledger: List[EconomicLossItem] = []
+    review_issue_ledger: List[ReviewIssueItem] = []
     risk_by_type: List[CategoryRisk]
     risk_by_rule: List[RuleBreakdown]
 
