@@ -101,10 +101,17 @@ class ShopifyAdapter:
                 row_errs.append(f"Row {row_num}: Unsupported Shopify event type '{raw_type}'. Type 'adjustment' and unknown events are blocked without explicit settlement evidence.")
                 tx_type = "UNKNOWN"
 
-            # 3. Currency Provenance Policy:
-            # Check CSV columns ('Currency', 'Payout Currency') first, then explicit upload metadata fallback_currency.
-            c_val = row.get("Payout Currency") or row.get("Currency") or fallback_currency
-            if not c_val or str(c_val).strip() == "":
+            # 3. Currency Selection Priority:
+            # valid Payout Currency -> valid Currency -> explicit fallback_currency
+            c_val = None
+            if "Payout Currency" in row and pd.notna(row["Payout Currency"]) and str(row["Payout Currency"]).strip() != "":
+                c_val = str(row["Payout Currency"]).strip()
+            elif "Currency" in row and pd.notna(row["Currency"]) and str(row["Currency"]).strip() != "":
+                c_val = str(row["Currency"]).strip()
+            elif fallback_currency and str(fallback_currency).strip() != "":
+                c_val = str(fallback_currency).strip()
+
+            if not c_val:
                 row_errs.append(f"Row {row_num}: Currency missing in file and upload metadata. Analysis blocked to prevent financial guesswork.")
                 currency = ""
             else:
@@ -148,8 +155,13 @@ class ShopifyAdapter:
             raw_tx_id = row.get("Transaction ID")
             src_tx_id = str(raw_tx_id).strip() if pd.notna(raw_tx_id) and str(raw_tx_id).strip() != "" else None
 
-            # Internal unique row identity (provenance tracking only, NOT authoritative provider ID)
-            internal_event_id = f"SHOPIFY:{source_filename or 'FILE'}:ROW_{row_num}:V{cls.VERSION}"
+            # Internal file identity policy: source_filename must be non-empty for production adapter processing
+            safe_filename = str(source_filename).strip() if source_filename else ""
+            if not safe_filename:
+                row_errs.append(f"Row {row_num}: Source file identifier missing. Adapter processing requires explicit source_filename.")
+                safe_filename = "UNIDENTIFIED"
+
+            internal_event_id = f"SHOPIFY:{safe_filename}:ROW_{row_num}:V{cls.VERSION}"
 
             if row_errs:
                 errors.extend(row_errs)

@@ -13,9 +13,15 @@ class CrossProviderLink(BaseModel):
     paypal_event_id: str
     shared_order_reference: str
     currency: str
-    matched_amount: float
-    confidence: float = 1.0
+    matched_amount: Decimal
+    confidence: float = 0.85
+    link_method: str = "EXACT_MERCHANT_REFERENCE"
+    link_status: str = "REFERENCE_MATCH"
+    evidence_level: str = "DETERMINISTIC_REFERENCE"
     link_reason: str
+
+    class Config:
+        arbitrary_types_allowed = True
 
 def perform_conservative_cross_provider_linking(events: List[CanonicalEvent]) -> List[CrossProviderLink]:
     """
@@ -25,6 +31,7 @@ def perform_conservative_cross_provider_linking(events: List[CanonicalEvent]) ->
     - Both events share the exact same currency
     - Both event types are compatible (e.g. sale to sale, refund to refund)
     Does NOT link by Item ID, does NOT link by amount alone, does NOT link across currencies.
+    Models the result explicitly as a deterministic reference match (evidence_level="DETERMINISTIC_REFERENCE").
     """
     shopify_by_order: Dict[Tuple[str, str], List[CanonicalEvent]] = {}
     paypal_by_order: Dict[Tuple[str, str], List[CanonicalEvent]] = {}
@@ -66,8 +73,11 @@ def perform_conservative_cross_provider_linking(events: List[CanonicalEvent]) ->
                         paypal_event_id=p_ev.transaction_id,
                         shared_order_reference=s_ev.order_id or ord_key,
                         currency=curr,
-                        matched_amount=float(abs(s_ev.gross_amount)),
-                        confidence=1.0,
+                        matched_amount=abs(s_ev.gross_amount),
+                        confidence=0.85,
+                        link_method="EXACT_MERCHANT_REFERENCE",
+                        link_status="REFERENCE_MATCH",
+                        evidence_level="DETERMINISTIC_REFERENCE",
                         link_reason=f"Deterministic cross-provider merchant order reference match: '{ord_key}' ({curr})"
                     ))
 

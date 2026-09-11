@@ -130,7 +130,6 @@ class TestProviderAdaptersReality(unittest.TestCase):
     def test_L_same_item_id_across_providers_does_not_link(self):
         """L. same Item ID across providers does not link."""
         df_sp = pd.DataFrame([{"Transaction Date": "2026-01-05", "Type": "charge", "Order": "ITEM_555", "Amount": "100.00", "Fee": "3.00", "Net": "97.00", "Payout Currency": "USD"}])
-        # PayPal row has Item ID = ITEM_555, but NO Invoice Number
         df_pp = pd.DataFrame([{"Date": "01/05/2026", "Time": "12:00:00", "TimeZone": "PST", "Name": "Buyer", "Type": "Payment Received", "Status": "Completed", "Currency": "USD", "Gross": "100.00", "Fee": "-3.00", "Net": "97.00", "Transaction ID": "PP123", "Item ID": "ITEM_555"}])
 
         _, events_sp = ShopifyAdapter.validate_and_normalize(df_sp, "sp.csv")
@@ -138,6 +137,135 @@ class TestProviderAdaptersReality(unittest.TestCase):
 
         links = perform_conservative_cross_provider_linking(events_sp + events_pp)
         self.assertEqual(len(links), 0)
+
+    # -------------------------------------------------------------------------
+    # NEW REGRESSION TESTS (Integration Safety Fix)
+    # -------------------------------------------------------------------------
+
+    def test_M_minimal_valid_generic_csv_processes_successfully(self):
+        """A. minimal valid generic CSV with only required headers processes successfully."""
+        df_gen = pd.DataFrame([{
+            "transaction_id": "tx_min_1",
+            "date": "2026-01-01",
+            "type": "sale",
+            "gross_amount": "100.00",
+            "currency": "USD"
+        }])
+        val, events = registry.process(df_gen, "min.csv")
+        self.assertTrue(val.is_valid)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].transaction_id, "GENERIC:tx_min_1")
+
+    def test_N_generic_csv_without_order_id_processes_successfully(self):
+        """B. generic CSV without order_id processes successfully."""
+        df_gen = pd.DataFrame([{
+            "transaction_id": "tx_min_2",
+            "date": "2026-01-01",
+            "type": "sale",
+            "gross_amount": "100.00",
+            "currency": "USD"
+        }])
+        val, events = registry.process(df_gen, "min.csv")
+        self.assertTrue(val.is_valid)
+        self.assertIsNone(events[0].order_id)
+
+    def test_O_generic_csv_without_fee_sets_has_source_fee_false(self):
+        """C. generic CSV without fee sets has_source_fee=False."""
+        df_gen = pd.DataFrame([{
+            "transaction_id": "tx_min_3",
+            "date": "2026-01-01",
+            "type": "sale",
+            "gross_amount": "100.00",
+            "currency": "USD"
+        }])
+        val, events = registry.process(df_gen, "min.csv")
+        self.assertTrue(val.is_valid)
+        self.assertFalse(events[0].has_source_fee)
+
+    def test_P_generic_csv_without_net_amount_sets_has_source_net_false(self):
+        """D. generic CSV without net_amount sets has_source_net=False."""
+        df_gen = pd.DataFrame([{
+            "transaction_id": "tx_min_4",
+            "date": "2026-01-01",
+            "type": "sale",
+            "gross_amount": "100.00",
+            "currency": "USD"
+        }])
+        val, events = registry.process(df_gen, "min.csv")
+        self.assertTrue(val.is_valid)
+        self.assertFalse(events[0].has_source_net)
+
+    def test_Q_malformed_generic_gross_amount_blocks(self):
+        """E. malformed generic gross amount blocks."""
+        df_gen = pd.DataFrame([{
+            "transaction_id": "tx_min_5",
+            "date": "2026-01-01",
+            "type": "sale",
+            "gross_amount": "abc",
+            "currency": "USD"
+        }])
+        val, events = registry.process(df_gen, "min.csv")
+        self.assertFalse(val.is_valid)
+        self.assertEqual(len(events), 0)
+
+    def test_R_decimal_survives_generic_registry_processing(self):
+        """F. Decimal survives generic registry processing."""
+        df_gen = pd.DataFrame([{
+            "transaction_id": "tx_min_6",
+            "date": "2026-01-01",
+            "type": "sale",
+            "gross_amount": "100.50",
+            "currency": "USD"
+        }])
+        val, events = registry.process(df_gen, "min.csv")
+        self.assertTrue(val.is_valid)
+        self.assertIsInstance(events[0].gross_amount, Decimal)
+        self.assertEqual(events[0].gross_amount, Decimal("100.50"))
+
+    def test_S_linker_uses_decimal_matched_amount_and_explicit_link_semantics(self):
+        """Test linker uses Decimal matched_amount and explicit link semantics."""
+        df_sp = pd.DataFrame([{"Transaction Date": "2026-01-05", "Type": "charge", "Order": "#1001", "Amount": "100.00", "Fee": "3.00", "Net": "97.00", "Payout Currency": "USD"}])
+        df_pp = pd.DataFrame([{"Date": "01/05/2026", "Time": "12:00:00", "TimeZone": "PST", "Name": "Buyer", "Type": "Payment Received", "Status": "Completed", "Currency": "USD", "Gross": "100.00", "Fee": "-3.00", "Net": "97.00", "Transaction ID": "PP123", "Invoice Number": "#1001"}])
+
+        _, events_sp = ShopifyAdapter.validate_and_normalize(df_sp, "sp.csv")
+        _, events_pp = PayPalAdapter.validate_and_normalize(df_pp, "pp.csv")
+
+        links = perform_conservative_cross_provider_linking(events_sp + events_pp)
+        self.assertEqual(len(links), 1)
+        self.assertIsInstance(links[0].matched_amount, Decimal)
+        self.assertEqual(links[0].matched_amount, Decimal("100.00"))
+        self.assertEqual(links[0].link_method, "EXACT_MERCHANT_REFERENCE")
+        self.assertEqual(links[0].link_status, "REFERENCE_MATCH")
+        self.assertEqual(links[0].evidence_level, "DETERMINISTIC_REFERENCE")
+
+    def test_T_shopify_missing_source_filename_blocks_normalization(self):
+        """Test Shopify missing source_filename blocks normalization."""
+        df_sp = pd.DataFrame([{"Transaction Date": "2026-01-05", "Type": "charge", "Order": "#1001", "Amount": "100.00", "Fee": "3.00", "Net": "97.00", "Payout Currency": "USD"}])
+        val, events = ShopifyAdapter.validate_and_normalize(df_sp, source_filename="")
+        self.assertFalse(val.is_valid)
+        self.assertTrue(any("source_filename" in err for err in val.errors))
+
+    def test_U_shopify_currency_selection_priority(self):
+        """Test Shopify currency selection priority (Payout Currency -> Currency -> fallback_currency)."""
+        # Case 1: Payout Currency present
+        df1 = pd.DataFrame([{"Transaction Date": "2026-01-05", "Type": "charge", "Order": "#1001", "Amount": "100.00", "Fee": "3.00", "Net": "97.00", "Payout Currency": "EUR", "Currency": "GBP"}])
+        _, ev1 = ShopifyAdapter.validate_and_normalize(df1, "file1.csv", fallback_currency="USD")
+        self.assertEqual(ev1[0].currency, "EUR")
+
+        # Case 2: Payout Currency missing/NaN, Currency present
+        df2 = pd.DataFrame([{"Transaction Date": "2026-01-05", "Type": "charge", "Order": "#1001", "Amount": "100.00", "Fee": "3.00", "Net": "97.00", "Currency": "GBP"}])
+        _, ev2 = ShopifyAdapter.validate_and_normalize(df2, "file2.csv", fallback_currency="USD")
+        self.assertEqual(ev2[0].currency, "GBP")
+
+        # Case 3: Both missing, fallback_currency present
+        df3 = pd.DataFrame([{"Transaction Date": "2026-01-05", "Type": "charge", "Order": "#1001", "Amount": "100.00", "Fee": "3.00", "Net": "97.00"}])
+        _, ev3 = ShopifyAdapter.validate_and_normalize(df3, "file3.csv", fallback_currency="CAD")
+        self.assertEqual(ev3[0].currency, "CAD")
+
+        # Case 4: All missing -> block
+        df4 = pd.DataFrame([{"Transaction Date": "2026-01-05", "Type": "charge", "Order": "#1001", "Amount": "100.00", "Fee": "3.00", "Net": "97.00"}])
+        val4, _ = ShopifyAdapter.validate_and_normalize(df4, "file4.csv")
+        self.assertFalse(val4.is_valid)
 
 if __name__ == "__main__":
     unittest.main()

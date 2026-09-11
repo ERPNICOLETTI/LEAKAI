@@ -1,4 +1,5 @@
 import pandas as pd
+import io
 from typing import Dict, Type, Tuple, List, Optional, Any
 
 try:
@@ -83,15 +84,20 @@ class AdapterRegistry:
         elif detection.provider_detected == "PAYPAL":
             return PayPalAdapter.validate_and_normalize(df, source_filename)
         elif detection.provider_detected == "GENERIC":
-            # Pass through generic normalizer
-            # Convert normalized DF back to CanonicalEvents
+            # Convert DF to CSV bytes buffer to reuse strict validate_and_normalize_csv pipeline cleanly
             try:
-                # We reuse the existing validate_and_normalize_csv via bytes buffer simulation
+                buf = io.BytesIO()
+                df.to_csv(buf, index=False)
+                val_res, norm_df = validate_and_normalize_csv(buf.getvalue())
+                if not val_res.is_valid or norm_df is None:
+                    return val_res, []
+
                 events: List[CanonicalEvent] = []
-                for idx, row in df.iterrows():
+                for idx, row in norm_df.iterrows():
                     row_num = idx + 1
                     tx_id = str(row['transaction_id']).strip()
                     o_id = str(row['order_id']).strip() if pd.notna(row['order_id']) and str(row['order_id']).lower() not in ['none', 'nan', ''] else None
+                    
                     events.append(CanonicalEvent(
                         transaction_id=f"GENERIC:{tx_id}",
                         order_id=o_id,
@@ -101,8 +107,8 @@ class AdapterRegistry:
                         fee=row['fee'],
                         net_amount=row['net_amount'],
                         currency=str(row['currency']).strip().upper(),
-                        has_source_fee=bool(row.get('has_source_fee', True)),
-                        has_source_net=bool(row.get('has_source_net', True)),
+                        has_source_fee=bool(row['has_source_fee']),
+                        has_source_net=bool(row['has_source_net']),
                         provider="GENERIC",
                         export_type="GENERIC_CANONICAL_CSV",
                         source_file_id=source_filename,
@@ -112,7 +118,7 @@ class AdapterRegistry:
                         adapter_version="1.0.0",
                         raw_data=row.get('raw_data', {})
                     ))
-                return FileValidationResult(is_valid=True, errors=[], valid_row_count=len(events)), events
+                return val_res, events
             except Exception as e:
                 return FileValidationResult(is_valid=False, errors=[f"Generic CSV processing error: {str(e)}"]), []
 
