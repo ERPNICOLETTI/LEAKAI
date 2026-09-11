@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 
 class AnomalyFlag(BaseModel):
@@ -25,7 +25,7 @@ class ReviewIssueItem(BaseModel):
     exposure_key: Optional[str] = None
     description: str
     amount_requiring_review: float
-    affected_raw_rows: List[str] = []
+    affected_raw_rows: List[str] = Field(default_factory=list)
 
 class TransactionRecord(BaseModel):
     transaction_id: str
@@ -36,9 +36,9 @@ class TransactionRecord(BaseModel):
     fee: float
     net_amount: float
     currency: str = "USD"
-    flags: List[AnomalyFlag] = []
+    flags: List[AnomalyFlag] = Field(default_factory=list)
     has_anomaly: bool = False
-    raw_data: Dict[str, Any] = {}
+    raw_data: Dict[str, Any] = Field(default_factory=dict)
 
 class CategoryRisk(BaseModel):
     category: str
@@ -52,6 +52,13 @@ class RuleBreakdown(BaseModel):
     count: int
     risk_amount: float
 
+class CurrencyFinancialSummary(BaseModel):
+    currency: str
+    total_gross_revenue: float
+    total_fees_paid: float
+    confirmed_loss_amount: float
+    potential_review_amount: float
+
 class AuditSummary(BaseModel):
     raw_record_count: int
     economic_event_count: int
@@ -62,10 +69,11 @@ class AuditSummary(BaseModel):
     confirmed_loss_amount: float
     potential_review_amount: float
     high_severity_count: int
-    economic_loss_ledger: List[EconomicLossItem] = []
-    review_issue_ledger: List[ReviewIssueItem] = []
-    risk_by_type: List[CategoryRisk]
-    risk_by_rule: List[RuleBreakdown]
+    economic_loss_ledger: List[EconomicLossItem] = Field(default_factory=list)
+    review_issue_ledger: List[ReviewIssueItem] = Field(default_factory=list)
+    financials_by_currency: List[CurrencyFinancialSummary] = Field(default_factory=list)
+    risk_by_type: List[CategoryRisk] = Field(default_factory=list)
+    risk_by_rule: List[RuleBreakdown] = Field(default_factory=list)
 
 class AnalysisResponse(BaseModel):
     summary: AuditSummary

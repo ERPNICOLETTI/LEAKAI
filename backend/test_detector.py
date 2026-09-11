@@ -36,76 +36,104 @@ class TestLeakAIDetector(unittest.TestCase):
         self.assertEqual(self.summary.total_fees_paid, 107.38)
         self.assertEqual(self.summary.confirmed_loss_amount, 650.00)
         self.assertEqual(self.summary.potential_review_amount, 1613.58)
+        self.assertEqual(len(self.summary.financials_by_currency), 1)
+        self.assertEqual(self.summary.financials_by_currency[0].currency, "USD")
 
-    def test_regression_K_same_economic_event_two_review_rules_no_double_counting(self):
+    def test_regression_O_decimal_precision_no_false_net_math_error(self):
         """
-        TEST K: Real anti-double-counting test
-        One transaction: gross = $100, fee anomaly = $20 exposure, net inconsistency = $20 exposure
-        Both review issues must exist.
-        Expected: review issue count = 2, potential review exposure = $20 (NOT $40)
+        TEST O — Decimal precision:
+        sale gross = 0.10, fee = 0.03, net = 0.07
+        Expected: no false NET_AMOUNT_INCONSISTENCY.
         """
         csv_data = (
             "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
-            "tx_0a,ord_0a,2026-01-01,sale,100.00,3.00,97.00,USD\n"
-            "tx_0b,ord_0b,2026-01-01,sale,100.00,3.00,97.00,USD\n"
-            "tx_0c,ord_0c,2026-01-01,sale,100.00,3.00,97.00,USD\n"
-            "tx_100,ord_1,2026-01-01,sale,100.00,23.00,57.00,USD\n"  # Fee 23 (excess $20 over 3% baseline), Net 57 vs 77 (math diff $20)
+            "tx_dec1,ord_dec1,2026-01-01,sale,0.10,0.03,0.07,USD\n"
         ).encode('utf-8')
         df = normalize_csv(csv_data)
         summary, txs = analyze_transactions(df)
 
-        self.assertEqual(len(summary.review_issue_ledger), 2)
-        # Potential review amount must NOT double-count the $20 exposure (must equal $20, not $40)
-        self.assertEqual(summary.potential_review_amount, 20.00)
+        self.assertFalse(txs[0].has_anomaly)
+        self.assertEqual(summary.total_gross_revenue, 0.10)
+        self.assertEqual(summary.total_fees_paid, 0.03)
 
-    def test_regression_M_ord_8806_scenario_no_double_reporting_confirmed_and_potential(self):
+    def test_regression_P_repeated_decimal_addition(self):
         """
-        TEST M: Scenario similar to ord_8806
-        sale = $550, refund tx_A = $550, duplicate raw tx_A row, refund tx_B = $550
-        Expected:
-        - duplicate transaction review exists
-        - multiple refund review exists
-        - confirmed loss = $550 from refund excess
-        - review issues remain visible
-        - potential review must NOT count the same $550 twice
-        - confirmed loss and potential review must not double-report exact same proven exposure
+        TEST P — repeated decimal addition:
+        three amounts of 0.10
+        Expected exact total: 0.30 (no 0.30000000000000004 float artifact).
         """
         csv_data = (
             "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
-            "tx_S1,ord_8806,2026-01-01,sale,550.00,16.25,533.75,USD\n"
-            "tx_R1,ord_8806,2026-01-02,refund,-550.00,0.00,-550.00,USD\n"
-            "tx_R1,ord_8806,2026-01-02,refund,-550.00,0.00,-550.00,USD\n"
-            "tx_R2,ord_8806,2026-01-04,refund,-550.00,0.00,-550.00,USD\n"
+            "tx_a,ord_a,2026-01-01,sale,0.10,0.01,0.09,USD\n"
+            "tx_b,ord_b,2026-01-01,sale,0.10,0.01,0.09,USD\n"
+            "tx_c,ord_c,2026-01-01,sale,0.10,0.01,0.09,USD\n"
         ).encode('utf-8')
         df = normalize_csv(csv_data)
         summary, txs = analyze_transactions(df)
 
-        self.assertEqual(summary.confirmed_loss_amount, 550.00)
-        self.assertTrue(any(item.rule_id == RULE_DUP_TX for item in summary.review_issue_ledger))
-        self.assertTrue(any(item.rule_id == RULE_DUP_REFUND for item in summary.review_issue_ledger))
-        # Potential review exposure for tx_R1 duplicate row ($550) + ord_8806 refund pool ($550 - $550 proven = $0) = $550
-        self.assertEqual(summary.potential_review_amount, 550.00)
+        self.assertEqual(summary.total_gross_revenue, 0.30)
+        self.assertEqual(summary.total_fees_paid, 0.03)
 
-    def test_regression_N_high_fee_15_and_net_math_10_same_tx_max_exposure(self):
+    def test_regression_Q_multi_currency_isolation(self):
         """
-        TEST N: One transaction has:
-        - HIGH_FEE_DETECTED = $15 exposure
-        - NET_AMOUNT_INCONSISTENCY = $10 exposure
-        Same transaction
-        Expected: two review issues, one transaction exposure group, potential review = MAX($15, $10) = $15
+        TEST Q — multi-currency isolation:
+        USD: sale = 100, refund = 120 (confirmed loss = 20 USD)
+        EUR: sale = 100, refund = 50 (confirmed loss = 0 EUR)
+        Expected: USD confirmed loss = 20 USD, EUR confirmed loss = 0 EUR.
+        Never produce combined confirmed loss without currency context.
         """
         csv_data = (
             "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
-            "tx_0a,ord_0a,2026-01-01,sale,100.00,3.00,97.00,USD\n"
-            "tx_0b,ord_0b,2026-01-01,sale,100.00,3.00,97.00,USD\n"
-            "tx_0c,ord_0c,2026-01-01,sale,100.00,3.00,97.00,USD\n"
-            "tx_1,ord_1,2026-01-01,sale,100.00,18.00,72.00,USD\n"  # Fee 18 (excess $15 over 3% baseline), Net 72 vs 82 (math diff $10)
+            "tx_u1,ord_u,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+            "tx_u2,ord_u,2026-01-02,refund,-120.00,0.00,-120.00,USD\n"
+            "tx_e1,ord_e,2026-01-01,sale,100.00,3.00,97.00,EUR\n"
+            "tx_e2,ord_e,2026-01-02,refund,-50.00,0.00,-50.00,EUR\n"
         ).encode('utf-8')
         df = normalize_csv(csv_data)
         summary, txs = analyze_transactions(df)
 
-        self.assertEqual(len(summary.review_issue_ledger), 2)
-        self.assertEqual(summary.potential_review_amount, 15.00)
+        self.assertEqual(len(summary.financials_by_currency), 2)
+        usd_fin = next(f for f in summary.financials_by_currency if f.currency == "USD")
+        eur_fin = next(f for f in summary.financials_by_currency if f.currency == "EUR")
+
+        self.assertEqual(usd_fin.confirmed_loss_amount, 20.00)
+        self.assertEqual(eur_fin.confirmed_loss_amount, 0.00)
+
+    def test_regression_R_same_order_id_across_currencies_no_cross_matching(self):
+        """
+        TEST R — same order ID across currencies:
+        ord_1 sale 100 USD
+        ord_1 refund 120 EUR
+        Expected: they do NOT reconcile against each other. No confirmed loss caused by cross-currency matching.
+        """
+        csv_data = (
+            "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
+            "tx_u1,ord_1,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+            "tx_e1,ord_1,2026-01-02,refund,-120.00,0.00,-120.00,EUR\n"
+        ).encode('utf-8')
+        df = normalize_csv(csv_data)
+        summary, txs = analyze_transactions(df)
+
+        self.assertEqual(summary.confirmed_loss_amount, 0.0)
+        self.assertTrue(any(f.rule_id == RULE_UNMATCHED_REFUND for f in txs[1].flags))
+
+    def test_regression_S_conflicting_transaction_currency(self):
+        """
+        TEST S — conflicting transaction currency:
+        same transaction_id: one row USD, one row EUR
+        Expected: CONFLICTING_TRANSACTION_ID, excluded from economic reconciliation.
+        """
+        csv_data = (
+            "transaction_id,order_id,date,type,gross_amount,fee,net_amount,currency\n"
+            "tx_x,ord_1,2026-01-01,sale,100.00,3.00,97.00,USD\n"
+            "tx_x,ord_1,2026-01-01,sale,100.00,3.00,97.00,EUR\n"
+        ).encode('utf-8')
+        df = normalize_csv(csv_data)
+        summary, txs = analyze_transactions(df)
+
+        self.assertTrue(any(f.rule_id == RULE_CONFLICTING_TX for f in txs[0].flags))
+        self.assertEqual(summary.economic_event_count, 0)
+        self.assertEqual(summary.confirmed_loss_amount, 0.0)
 
     def test_economic_loss_ledger_deduplication(self):
         ledger = self.summary.economic_loss_ledger

@@ -1,10 +1,28 @@
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Tuple, Optional
+from decimal import Decimal, ROUND_HALF_UP
+
 try:
-    from models import TransactionRecord, AnomalyFlag, AuditSummary, CategoryRisk, RuleBreakdown, EconomicLossItem, ReviewIssueItem
+    from models import (
+        TransactionRecord, AnomalyFlag, AuditSummary, CategoryRisk, 
+        RuleBreakdown, EconomicLossItem, ReviewIssueItem, CurrencyFinancialSummary
+    )
 except ImportError:
-    from .models import TransactionRecord, AnomalyFlag, AuditSummary, CategoryRisk, RuleBreakdown, EconomicLossItem, ReviewIssueItem
+    from .models import (
+        TransactionRecord, AnomalyFlag, AuditSummary, CategoryRisk, 
+        RuleBreakdown, EconomicLossItem, ReviewIssueItem, CurrencyFinancialSummary
+    )
+
+MONEY_QUANT = Decimal("0.01")
+
+def money(val: Any) -> Decimal:
+    if val is None or val == "":
+        return Decimal("0.00")
+    if isinstance(val, Decimal):
+        return val.quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+    s_val = str(val).strip()
+    return Decimal(s_val).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
 
 RULE_DUP_TX = "DUPLICATE_TRANSACTION_ID"
 RULE_CONFLICTING_TX = "CONFLICTING_TRANSACTION_ID"
@@ -73,13 +91,13 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
     for idx, row in df.iterrows():
         tx_id = str(row['transaction_id']).strip()
         order_id = str(row['order_id']).strip() if pd.notna(row['order_id']) and str(row['order_id']).lower() not in ['none', 'nan', ''] else None
-        gross = float(row['gross_amount'])
-        fee = float(row['fee'])
-        net = float(row['net_amount'])
+        gross = money(row['gross_amount'])
+        fee = money(row['fee'])
+        net = money(row['net_amount'])
         tx_type = str(row['type']).lower().strip()
         date_str = str(row['date']).strip()
         dt = row['dt']
-        curr = str(row['currency']).strip()
+        curr = str(row['currency']).strip().upper()
 
         raw_records.append({
             "index": idx,
@@ -103,13 +121,14 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
         issue_id: str, 
         rule_id: str, 
         desc: str, 
-        amount: float, 
+        amount: Decimal, 
         order_id: Optional[str] = None, 
         tx_id: Optional[str] = None, 
         exposure_key: Optional[str] = None,
         affected_rows: Optional[List[str]] = None
     ):
         rows_list = affected_rows if affected_rows is not None else []
+        dec_amt = money(amount)
         if not any(item.review_issue_id == issue_id for item in review_issue_ledger):
             review_issue_ledger.append(ReviewIssueItem(
                 review_issue_id=issue_id,
@@ -118,7 +137,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 transaction_id=tx_id,
                 exposure_key=exposure_key,
                 description=desc,
-                amount_requiring_review=round(max(0.0, amount), 2),
+                amount_requiring_review=float(max(Decimal("0.00"), dec_amt)),
                 affected_raw_rows=rows_list
             ))
 
@@ -140,9 +159,9 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
             rec = raw_records[idx]
             if (rec["order_id"] != first_rec["order_id"] or
                 rec["type"] != first_rec["type"] or
-                abs(rec["gross_amount"] - first_rec["gross_amount"]) > 0.001 or
-                abs(rec["fee"] - first_rec["fee"]) > 0.001 or
-                abs(rec["net_amount"] - first_rec["net_amount"]) > 0.001 or
+                rec["gross_amount"] != first_rec["gross_amount"] or
+                rec["fee"] != first_rec["fee"] or
+                rec["net_amount"] != first_rec["net_amount"] or
                 rec["currency"] != first_rec["currency"]):
                 has_conflict = True
                 break
@@ -152,7 +171,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
         if has_conflict:
             conflicting_tx_ids.add(t_id)
             conflict_amount = max(abs(raw_records[i]["gross_amount"]) for i in indices)
-            desc = f"Transaction ID '{t_id}' has conflicting monetary/metadata fields across {len(indices)} raw rows. Excluded from confirmed loss."
+            desc = f"Transaction ID '{t_id}' has conflicting monetary or currency fields across {len(indices)} raw rows. Excluded from economic reconciliation."
             
             add_review_issue(
                 issue_id=f"REVIEW-CONFLICTING-TX-{t_id}",
@@ -172,7 +191,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                     severity="HIGH",
                     classification="REVIEW_REQUIRED",
                     description=desc,
-                    amount_at_risk=abs(rec["gross_amount"])
+                    amount_at_risk=float(abs(rec["gross_amount"]))
                 )
                 add_flag_if_missing(rec["flags"], flag)
         else:
@@ -197,7 +216,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                     severity="MEDIUM",
                     classification="REVIEW_REQUIRED",
                     description=desc,
-                    amount_at_risk=dup_amount
+                    amount_at_risk=float(dup_amount)
                 )
                 add_flag_if_missing(rec["flags"], flag)
 
@@ -217,36 +236,47 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
             seen_tx_ids.add(t_id)
         economic_events.append(r)
 
-    # DYNAMIC MEDIAN FEE BASELINE CALCULATION STRICTLY FROM DEDUPLICATED ECONOMIC SALES
-    sale_fee_percentages = [
-        (ev["fee"] / ev["gross_amount"]) * 100.0
-        for ev in economic_events
-        if ev["type"] == "sale" and ev["gross_amount"] > 0 and ev["fee"] >= 0
-    ]
-    median_fee_pct = float(np.median(sale_fee_percentages)) if sale_fee_percentages else 3.0
-    fee_threshold_pct = max(median_fee_pct * 2.0, median_fee_pct + 5.0)
+    # DYNAMIC MEDIAN FEE BASELINE CALCULATION PER CURRENCY
+    fee_thresholds_by_currency: Dict[str, float] = {}
+    median_fee_by_currency: Dict[str, float] = {}
 
-    # Index economic events by Order ID
-    econ_order_map: Dict[str, List[Dict[str, Any]]] = {}
-    sales_by_order: Dict[str, float] = {}
+    sales_by_curr: Dict[str, List[float]] = {}
+    for ev in economic_events:
+        curr = ev["currency"]
+        if ev["type"] == "sale" and ev["gross_amount"] > Decimal("0.00") and ev["fee"] >= Decimal("0.00"):
+            pct = float((ev["fee"] / ev["gross_amount"]) * Decimal("100.00"))
+            sales_by_curr.setdefault(curr, []).append(pct)
+
+    for curr, pcts in sales_by_curr.items():
+        med_pct = float(np.median(pcts)) if pcts else 3.0
+        median_fee_by_currency[curr] = med_pct
+        fee_thresholds_by_currency[curr] = max(med_pct * 2.0, med_pct + 5.0)
+
+    # CURRENCY-SCOPED ORDER RECONCILIATION INDEX
+    # Key: (order_id, currency)
+    econ_order_map: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    sales_by_order_curr: Dict[Tuple[str, str], Decimal] = {}
 
     for ev in economic_events:
         o_id = ev["order_id"]
+        curr = ev["currency"]
         if o_id:
-            econ_order_map.setdefault(o_id, []).append(ev)
+            key = (o_id, curr)
+            econ_order_map.setdefault(key, []).append(ev)
             if ev["type"] == "sale":
-                sales_by_order[o_id] = sales_by_order.get(o_id, 0.0) + abs(ev["gross_amount"])
+                sales_by_order_curr[key] = sales_by_order_curr.get(key, Decimal("0.00")) + abs(ev["gross_amount"])
 
     # RULE 7: UNMATCHED_REFUND / CHARGEBACK (ECONOMIC LAYER, REVIEW_REQUIRED)
     for ev in economic_events:
         if ev["type"] in ["refund", "chargeback"]:
             o_id = ev["order_id"]
+            curr = ev["currency"]
             has_sale = False
-            if o_id and o_id in econ_order_map:
-                has_sale = any(e["type"] == "sale" for e in econ_order_map[o_id])
+            if o_id and (o_id, curr) in econ_order_map:
+                has_sale = any(e["type"] == "sale" for e in econ_order_map[(o_id, curr)])
             
             if not has_sale:
-                desc = f"{ev['type'].upper()} of ${abs(ev['gross_amount']):,.2f} has no matching sale in dataset (may exist in prior statement)."
+                desc = f"{ev['type'].upper()} of {curr} ${abs(ev['gross_amount']):,.2f} has no matching sale in dataset for currency {curr}."
                 add_review_issue(
                     issue_id=f"REVIEW-UNMATCHED-{ev['transaction_id']}",
                     rule_id=RULE_UNMATCHED_REFUND,
@@ -263,15 +293,15 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                     severity="MEDIUM",
                     classification="REVIEW_REQUIRED",
                     description=desc,
-                    amount_at_risk=abs(ev["gross_amount"])
+                    amount_at_risk=float(abs(ev["gross_amount"]))
                 )
                 add_flag_if_missing(ev["flags"], flag)
 
-    # ORDER-LEVEL MONETARY RECONCILIATION & ECONOMIC LOSS LEDGER
+    # ORDER-LEVEL MONETARY RECONCILIATION & ECONOMIC LOSS LEDGER (CURRENCY SCOPED)
     economic_loss_ledger: List[EconomicLossItem] = []
-    order_confirmed_loss_map: Dict[str, float] = {}
+    order_curr_confirmed_loss_map: Dict[Tuple[str, str], Decimal] = {}
 
-    for o_id, events in econ_order_map.items():
+    for (o_id, curr), events in econ_order_map.items():
         refund_events = [e for e in events if e["type"] == "refund"]
         has_sale = any(e["type"] == "sale" for e in events)
 
@@ -289,16 +319,16 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 if days_gap <= 7:
                     prev_amt = abs(r_prev["gross_amount"])
                     curr_amt = abs(r_curr["gross_amount"])
-                    desc = f"Multiple refund events for Order '{o_id}' within {days_gap} day(s) (${prev_amt:,.2f} and ${curr_amt:,.2f}). Review partial refund validity."
+                    desc = f"Multiple refund events for Order '{o_id}' ({curr}) within {days_gap} day(s) (${prev_amt:,.2f} and ${curr_amt:,.2f}). Review partial refund validity."
                     
                     add_review_issue(
-                        issue_id=f"REVIEW-MULTI-REFUND-{o_id}",
+                        issue_id=f"REVIEW-MULTI-REFUND-{o_id}-{curr}",
                         rule_id=RULE_DUP_REFUND,
                         desc=desc,
                         amount=curr_amt,
                         order_id=o_id,
                         tx_id=r_curr["transaction_id"],
-                        exposure_key=f"EXPOSURE-ORDER-REFUND-{o_id}",
+                        exposure_key=f"EXPOSURE-ORDER-REFUND-{o_id}-{curr}",
                         affected_rows=[str(r_prev["index"]), str(r_curr["index"])]
                     )
 
@@ -308,18 +338,18 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                         severity="MEDIUM",
                         classification="REVIEW_REQUIRED",
                         description=desc,
-                        amount_at_risk=curr_amt
+                        amount_at_risk=float(curr_amt)
                     )
                     add_flag_if_missing(r_curr["flags"], flag)
 
-        # RULE 6: REFUND_EXCEEDS_SALE (CONFIRMED_LOSS FROM RECONCILIATION)
+        # RULE 6: REFUND_EXCEEDS_SALE (CURRENCY SCOPED CONFIRMED LOSS)
         if has_sale and refund_events:
-            sale_total = sales_by_order.get(o_id, 0.0)
-            total_unique_refunds = sum(abs(e["gross_amount"]) for e in refund_events)
+            sale_total = sales_by_order_curr.get((o_id, curr), Decimal("0.00"))
+            total_unique_refunds = sum((abs(e["gross_amount"]) for e in refund_events), Decimal("0.00"))
 
-            if total_unique_refunds > sale_total + 0.01:
-                net_excess_loss = total_unique_refunds - sale_total
-                loss_id = f"LOSS-EXCESS-REFUND-{o_id}"
+            if total_unique_refunds > sale_total + Decimal("0.01"):
+                net_excess_loss = (total_unique_refunds - sale_total).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+                loss_id = f"LOSS-EXCESS-REFUND-{o_id}-{curr}"
 
                 if not any(item.economic_loss_id == loss_id for item in economic_loss_ledger):
                     economic_loss_ledger.append(EconomicLossItem(
@@ -327,10 +357,10 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                         order_id=o_id,
                         transaction_id=refund_events[-1]["transaction_id"],
                         rule_id=RULE_REFUND_EXCEEDS,
-                        description=f"Net refund excess over original sale price for Order '{o_id}' (${total_unique_refunds:,.2f} unique refunds vs ${sale_total:,.2f} sale).",
-                        proven_loss_amount=round(net_excess_loss, 2)
+                        description=f"Net refund excess over original sale price for Order '{o_id}' ({curr}) (${total_unique_refunds:,.2f} unique refunds vs ${sale_total:,.2f} sale).",
+                        proven_loss_amount=float(net_excess_loss)
                     ))
-                    order_confirmed_loss_map[o_id] = round(net_excess_loss, 2)
+                    order_curr_confirmed_loss_map[(o_id, curr)] = net_excess_loss
 
                 for r_ev in refund_events:
                     flag = AnomalyFlag(
@@ -338,8 +368,8 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                         rule_name=RULE_METADATA[RULE_REFUND_EXCEEDS]["name"],
                         severity="HIGH",
                         classification="CONFIRMED_LOSS",
-                        description=f"Order '{o_id}' unique refunds (${total_unique_refunds:,.2f}) exceed sale (${sale_total:,.2f}) by ${net_excess_loss:,.2f} net excess.",
-                        amount_at_risk=round(net_excess_loss, 2)
+                        description=f"Order '{o_id}' ({curr}) unique refunds (${total_unique_refunds:,.2f}) exceed sale (${sale_total:,.2f}) by ${net_excess_loss:,.2f} net excess.",
+                        amount_at_risk=float(net_excess_loss)
                     )
                     add_flag_if_missing(r_ev["flags"], flag)
 
@@ -351,6 +381,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
         t_type = rec["type"]
         o_id = rec["order_id"]
         t_id = rec["transaction_id"]
+        curr = rec["currency"]
 
         # RULE 3: MISSING_ORDER_ID (REVIEW_REQUIRED)
         if not o_id and t_type in ["sale", "refund", "chargeback"]:
@@ -359,7 +390,7 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 issue_id=f"REVIEW-MISSING-ORDER-{t_id}",
                 rule_id=RULE_MISSING_ORDER,
                 desc=desc,
-                amount=0.0,
+                amount=Decimal("0.00"),
                 tx_id=t_id,
                 exposure_key=None,
                 affected_rows=[str(rec["index"])]
@@ -375,10 +406,10 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
             add_flag_if_missing(rec["flags"], flag)
 
         # RULE 4: NET_AMOUNT_INCONSISTENCY (REVIEW_REQUIRED)
-        expected_net = gross - fee
-        if abs(net - expected_net) > 0.01:
-            diff = round(abs(net - expected_net), 2)
-            desc = f"Net settlement variance: Net (${net:,.2f}) != Gross (${gross:,.2f}) - Fee (${fee:,.2f}) [Variance: ${diff:,.2f}]. Review gateway accounting log."
+        expected_net = (gross - fee).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+        if abs(net - expected_net) > Decimal("0.01"):
+            diff = abs(net - expected_net).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+            desc = f"Net settlement variance: Net ({curr} ${net:,.2f}) != Gross (${gross:,.2f}) - Fee (${fee:,.2f}) [Variance: ${diff:,.2f}]. Review gateway log."
             add_review_issue(
                 issue_id=f"REVIEW-NET-MATH-{t_id}",
                 rule_id=RULE_NET_MATH,
@@ -395,22 +426,25 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 severity="MEDIUM",
                 classification="REVIEW_REQUIRED",
                 description=desc,
-                amount_at_risk=diff
+                amount_at_risk=float(diff)
             )
             add_flag_if_missing(rec["flags"], flag)
 
         # RULE 5: HIGH_FEE_DETECTED (REVIEW_REQUIRED)
-        if gross > 0 and fee > 0:
-            fee_pct = (fee / gross) * 100.0
-            if fee_pct > fee_threshold_pct:
-                normal_fee = gross * (median_fee_pct / 100.0)
-                excess_fee = fee - normal_fee
-                desc = f"Gateway processing fee of ${fee:,.2f} ({fee_pct:.1f}%) is materially above dataset median sale baseline ({median_fee_pct:.1f}%). Excess: ${excess_fee:,.2f}."
+        if gross > Decimal("0.00") and fee > Decimal("0.00"):
+            fee_pct = float((fee / gross) * Decimal("100.00"))
+            curr_threshold = fee_thresholds_by_currency.get(curr, 8.0)
+            curr_median = median_fee_by_currency.get(curr, 3.0)
+
+            if fee_pct > curr_threshold:
+                normal_fee = (gross * Decimal(str(curr_median / 100.0))).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+                excess_fee = (fee - normal_fee).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+                desc = f"Gateway fee of ${fee:,.2f} ({fee_pct:.1f}%) is materially above {curr} median baseline ({curr_median:.1f}%). Excess: ${excess_fee:,.2f}."
                 add_review_issue(
                     issue_id=f"REVIEW-HIGH-FEE-{t_id}",
                     rule_id=RULE_HIGH_FEE,
                     desc=desc,
-                    amount=round(excess_fee, 2),
+                    amount=excess_fee,
                     order_id=o_id,
                     tx_id=t_id,
                     exposure_key=f"EXPOSURE-TX-{t_id}",
@@ -422,13 +456,13 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                     severity="LOW",
                     classification="REVIEW_REQUIRED",
                     description=desc,
-                    amount_at_risk=round(excess_fee, 2)
+                    amount_at_risk=float(excess_fee)
                 )
                 add_flag_if_missing(rec["flags"], flag)
 
         # RULE 8: INVALID_NEGATIVE_FEE (REVIEW_REQUIRED)
-        if fee < 0:
-            desc = f"Transaction contains invalid negative fee of ${fee:,.2f}. Review gateway fee credit adjustment."
+        if fee < Decimal("0.00"):
+            desc = f"Transaction contains invalid negative fee of ${fee:,.2f}. Review fee credit adjustment."
             add_review_issue(
                 issue_id=f"REVIEW-NEG-FEE-{t_id}",
                 rule_id=RULE_NEG_FEE,
@@ -445,45 +479,86 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
                 severity="LOW",
                 classification="REVIEW_REQUIRED",
                 description=desc,
-                amount_at_risk=abs(fee)
+                amount_at_risk=float(abs(fee))
             )
             add_flag_if_missing(rec["flags"], flag)
 
     # -------------------------------------------------------------------------
-    # 3. FINANCIAL TOTALS: Calculated STRICTLY from ECONOMIC EVENTS ONLY
+    # 3. FINANCIAL TOTALS BY CURRENCY & ISOLATION
     # -------------------------------------------------------------------------
-    total_gross_revenue = sum(ev["gross_amount"] for ev in economic_events if ev["type"] == "sale")
-    total_fees_paid = sum(ev["fee"] for ev in economic_events)
+    all_currencies = sorted(list(set(r["currency"] for r in raw_records)))
+    financials_by_currency: List[CurrencyFinancialSummary] = []
 
-    tx_list: List[TransactionRecord] = []
-    anomalous_tx_ids = set()
-    high_severity_count = 0
+    for curr in all_currencies:
+        curr_events = [e for e in economic_events if e["currency"] == curr]
+        curr_rev = sum((e["gross_amount"] for e in curr_events if e["type"] == "sale"), Decimal("0.00"))
+        curr_fees = sum((e["fee"] for e in curr_events), Decimal("0.00"))
 
-    confirmed_loss_amount = round(sum(item.proven_loss_amount for item in economic_loss_ledger), 2)
+        curr_loss = sum(
+            (Decimal(str(item.proven_loss_amount)) for item in economic_loss_ledger 
+             if any(e["transaction_id"] == item.transaction_id and e["currency"] == curr for e in raw_records)),
+            Decimal("0.00")
+        )
 
-    # -------------------------------------------------------------------------
-    # 4. REVIEW EXPOSURE AGGREGATION: Group by exposure_key (MAX per key)
-    #    Subtract any proven confirmed loss already accounted for in that pool
-    # -------------------------------------------------------------------------
-    exposure_groups: Dict[str, float] = {}
+        curr_exposure_groups: Dict[str, Decimal] = {}
+        for item in review_issue_ledger:
+            e_key = item.exposure_key
+            if not e_key:
+                continue
+            # Filter exposure key to curr
+            if e_key.endswith(f"-{curr}") or any(r["transaction_id"] == item.transaction_id and r["currency"] == curr for r in raw_records):
+                curr_exposure_groups[e_key] = max(curr_exposure_groups.get(e_key, Decimal("0.00")), money(item.amount_requiring_review))
+
+        curr_review = Decimal("0.00")
+        for e_key, gross_exp in curr_exposure_groups.items():
+            already_proven = Decimal("0.00")
+            if e_key.startswith("EXPOSURE-ORDER-REFUND-"):
+                # e_key format: EXPOSURE-ORDER-REFUND-{order_id}-{curr}
+                parts = e_key.replace("EXPOSURE-ORDER-REFUND-", "").split("-")
+                o_id_part = parts[0]
+                already_proven = order_curr_confirmed_loss_map.get((o_id_part, curr), Decimal("0.00"))
+
+            unproven = max(Decimal("0.00"), gross_exp - already_proven)
+            curr_review += unproven
+
+        financials_by_currency.append(CurrencyFinancialSummary(
+            currency=curr,
+            total_gross_revenue=float(curr_rev),
+            total_fees_paid=float(curr_fees),
+            confirmed_loss_amount=float(curr_loss),
+            potential_review_amount=float(curr_review)
+        ))
+
+    # Overall summary values (for single currency, or primary aggregate)
+    total_gross_revenue = float(sum((ev["gross_amount"] for ev in economic_events if ev["type"] == "sale"), Decimal("0.00")))
+    total_fees_paid = float(sum((ev["fee"] for ev in economic_events), Decimal("0.00")))
+    confirmed_loss_amount = float(sum((Decimal(str(item.proven_loss_amount)) for item in economic_loss_ledger), Decimal("0.00")))
+
+    # Review exposure total across all currency exposure groups
+    global_exposure_groups: Dict[str, Decimal] = {}
     for item in review_issue_ledger:
         e_key = item.exposure_key
         if not e_key:
             continue
-        exposure_groups[e_key] = max(exposure_groups.get(e_key, 0.0), item.amount_requiring_review)
+        global_exposure_groups[e_key] = max(global_exposure_groups.get(e_key, Decimal("0.00")), money(item.amount_requiring_review))
 
-    potential_review_amount = 0.0
-    for e_key, gross_exposure in exposure_groups.items():
-        already_proven = 0.0
-        # If this exposure key is associated with an order refund pool, subtract proven loss for that order
+    potential_review_amount_dec = Decimal("0.00")
+    for e_key, gross_exp in global_exposure_groups.items():
+        already_proven = Decimal("0.00")
         if e_key.startswith("EXPOSURE-ORDER-REFUND-"):
-            o_id = e_key.replace("EXPOSURE-ORDER-REFUND-", "")
-            already_proven = order_confirmed_loss_map.get(o_id, 0.0)
+            parts = e_key.replace("EXPOSURE-ORDER-REFUND-", "").split("-")
+            o_id_part = parts[0]
+            curr_part = parts[1] if len(parts) > 1 else "USD"
+            already_proven = order_curr_confirmed_loss_map.get((o_id_part, curr_part), Decimal("0.00"))
 
-        unproven_exposure = max(0.0, gross_exposure - already_proven)
-        potential_review_amount += unproven_exposure
+        unproven = max(Decimal("0.00"), gross_exp - already_proven)
+        potential_review_amount_dec += unproven
 
-    potential_review_amount = round(potential_review_amount, 2)
+    potential_review_amount = float(potential_review_amount_dec)
+
+    tx_list: List[TransactionRecord] = []
+    anomalous_tx_ids = set()
+    high_severity_count = 0
 
     type_risk_map: Dict[str, float] = {}
     type_count_map: Dict[str, int] = {}
@@ -512,9 +587,9 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
             order_id=rec["order_id"],
             date=rec["date"],
             type=rec["type"],
-            gross_amount=rec["gross_amount"],
-            fee=rec["fee"],
-            net_amount=rec["net_amount"],
+            gross_amount=float(rec["gross_amount"]),
+            fee=float(rec["fee"]),
+            net_amount=float(rec["net_amount"]),
             currency=rec["currency"],
             flags=flags,
             has_anomaly=has_anomaly,
@@ -543,14 +618,15 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
         raw_record_count=len(raw_records),
         economic_event_count=len(economic_events),
         total_transactions=len(raw_records),
-        total_gross_revenue=round(total_gross_revenue, 2),
-        total_fees_paid=round(total_fees_paid, 2),
+        total_gross_revenue=total_gross_revenue,
+        total_fees_paid=total_fees_paid,
         total_anomalous_transactions=len(anomalous_tx_ids),
         confirmed_loss_amount=confirmed_loss_amount,
         potential_review_amount=potential_review_amount,
         high_severity_count=high_severity_count,
         economic_loss_ledger=economic_loss_ledger,
         review_issue_ledger=review_issue_ledger,
+        financials_by_currency=financials_by_currency,
         risk_by_type=risk_by_type,
         risk_by_rule=risk_by_rule
     )
