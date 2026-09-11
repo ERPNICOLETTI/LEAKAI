@@ -20,21 +20,21 @@ export default function SummaryCards({ summary }) {
           {formatCurrency(summary.confirmed_loss_amount)}
         </div>
         <div className="metric-sub">
-          Direct revenue lost from uncollected or duplicate refunds
+          {summary.economic_loss_ledger ? summary.economic_loss_ledger.length : 0} proven economic loss entries in ledger
         </div>
       </div>
 
-      {/* POTENTIAL RISK / REVIEW REQUIRED */}
+      {/* POTENTIAL AMOUNT REQUIRING REVIEW */}
       <div className="metric-card warning">
         <div className="metric-header">
-          <span>POTENTIAL RISK / REVIEW</span>
+          <span>POTENTIAL AMOUNT REQUIRING REVIEW</span>
           <AlertTriangle size={20} color="#f59e0b" />
         </div>
         <div className="metric-value" style={{ color: '#f59e0b' }}>
-          {formatCurrency(summary.potential_risk_amount)}
+          {formatCurrency(summary.potential_review_amount)}
         </div>
         <div className="metric-sub">
-          Flagged data quality, missing refs & fee anomalies
+          Not money lost • Data quality & gateway variance
         </div>
       </div>
 
@@ -62,7 +62,7 @@ export default function SummaryCards({ summary }) {
           {formatCurrency(summary.total_fees_paid)}
         </div>
         <div className="metric-sub">
-          {summary.total_anomalous_transactions} flagged transactions ({summary.high_severity_count} High)
+          {summary.total_anomalous_transactions} total flagged records ({summary.high_severity_count} High)
         </div>
       </div>
     </div>

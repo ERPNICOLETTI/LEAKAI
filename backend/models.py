@@ -9,6 +9,14 @@ class AnomalyFlag(BaseModel):
     description: str
     amount_at_risk: float
 
+class EconomicLossItem(BaseModel):
+    economic_loss_id: str
+    order_id: Optional[str] = None
+    transaction_id: str
+    rule_id: str
+    description: str
+    proven_loss_amount: float
+
 class TransactionRecord(BaseModel):
     transaction_id: str
     order_id: Optional[str] = None
@@ -40,8 +48,9 @@ class AuditSummary(BaseModel):
     total_fees_paid: float
     total_anomalous_transactions: int
     confirmed_loss_amount: float
-    potential_risk_amount: float
+    potential_review_amount: float
     high_severity_count: int
+    economic_loss_ledger: List[EconomicLossItem] = []
     risk_by_type: List[CategoryRisk]
     risk_by_rule: List[RuleBreakdown]
 
