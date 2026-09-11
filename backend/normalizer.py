@@ -41,7 +41,8 @@ def parse_decimal_strict(val_str: Any) -> Decimal:
     """
     Parses a monetary string strictly into Decimal.
     Valid zeros ("0", "0.00", "$0.00") return Decimal("0.00").
-    Malformed strings ("abc", "--", "N/A") raise ValueError.
+    Malformed or ambiguous strings ("abc", "--", "N/A", "1,23", "1.234,56") raise ValueError.
+    Supported US formats: 1234.56, 1,234.56, $1,234.56, -1234.56, (1234.56).
     """
     if val_str is None or pd.isna(val_str):
         raise ValueError("Monetary amount is missing or null.")
@@ -53,9 +54,23 @@ def parse_decimal_strict(val_str: Any) -> Decimal:
     is_negative = False
     if val_str.startswith('(') and val_str.endswith(')'):
         is_negative = True
-        val_str = val_str[1:-1]
+        val_str = val_str[1:-1].strip()
 
-    # Remove currency signs and commas
+    # Reject ambiguous European comma formats like "1,23" or "1.234,56"
+    # If comma is present, check US grouping rules
+    if ',' in val_str:
+        # If there's a comma and a dot, comma must come before dot
+        if '.' in val_str:
+            if val_str.rfind(',') > val_str.rfind('.'):
+                raise ValueError(f"Ambiguous monetary format (comma after dot): '{val_str}'")
+        # If comma is present, verify standard thousands grouping (e.g. 1,234 or 1,234,567 or 1234,56 is invalid)
+        # Strip currency symbols and negative signs first for regex check
+        clean_check = re.sub(r'[\$\s-]', '', val_str)
+        # Check standard US comma pattern: e.g. 1,234 or 1,234.56 or 12,345
+        if not re.match(r'^\d{1,3}(,\d{3})+(\.\d+)?$', clean_check):
+            raise ValueError(f"Ambiguous or invalid comma placement in monetary string: '{val_str}'")
+
+    # Remove currency signs and commas for Decimal parsing
     cleaned = re.sub(r'[^\d.-]', '', val_str)
     if not cleaned or cleaned in ['-', '.', '-.']:
         raise ValueError(f"Malformed monetary string: '{val_str}'")
@@ -265,6 +280,9 @@ def validate_and_normalize_csv(contents: bytes) -> Tuple[FileValidationResult, O
             row_error_count += 1
             errors.extend(row_errs)
 
+        has_source_fee = True if fee_col and pd.notna(row[fee_col]) else False
+        has_source_net = True if net_col and pd.notna(row[net_col]) else False
+
         normalized_rows.append({
             'transaction_id': tx_id,
             'order_id': order_id,
@@ -274,6 +292,8 @@ def validate_and_normalize_csv(contents: bytes) -> Tuple[FileValidationResult, O
             'fee': fee,
             'net_amount': net,
             'currency': currency,
+            'has_source_fee': has_source_fee,
+            'has_source_net': has_source_net,
             'raw_data': raw_dict
         })
 

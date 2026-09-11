@@ -405,33 +405,37 @@ def analyze_transactions(df: pd.DataFrame) -> Tuple[AuditSummary, List[Transacti
             )
             add_flag_if_missing(rec["flags"], flag)
 
-        # RULE 4: NET_AMOUNT_INCONSISTENCY (REVIEW_REQUIRED)
-        expected_net = (gross - fee).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
-        if abs(net - expected_net) > Decimal("0.01"):
-            diff = abs(net - expected_net).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
-            desc = f"Net settlement variance: Net ({curr} ${net:,.2f}) != Gross (${gross:,.2f}) - Fee (${fee:,.2f}) [Variance: ${diff:,.2f}]. Review gateway log."
-            add_review_issue(
-                issue_id=f"REVIEW-NET-MATH-{t_id}",
-                rule_id=RULE_NET_MATH,
-                desc=desc,
-                amount=diff,
-                order_id=o_id,
-                tx_id=t_id,
-                exposure_key=f"EXPOSURE-TX-{t_id}",
-                affected_rows=[str(rec["index"])]
-            )
-            flag = AnomalyFlag(
-                rule_id=RULE_NET_MATH,
-                rule_name=RULE_METADATA[RULE_NET_MATH]["name"],
-                severity="MEDIUM",
-                classification="REVIEW_REQUIRED",
-                description=desc,
-                amount_at_risk=float(diff)
-            )
-            add_flag_if_missing(rec["flags"], flag)
+        has_source_fee = bool(rec.get("has_source_fee", True))
+        has_source_net = bool(rec.get("has_source_net", True))
 
-        # RULE 5: HIGH_FEE_DETECTED (REVIEW_REQUIRED)
-        if gross > Decimal("0.00") and fee > Decimal("0.00"):
+        # RULE 4: NET_AMOUNT_INCONSISTENCY (REVIEW_REQUIRED) - ONLY IF SOURCE NET WAS SUPPLIED
+        if has_source_net:
+            expected_net = (gross - fee).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+            if abs(net - expected_net) > Decimal("0.01"):
+                diff = abs(net - expected_net).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+                desc = f"Net settlement variance: Net ({curr} ${net:,.2f}) != Gross (${gross:,.2f}) - Fee (${fee:,.2f}) [Variance: ${diff:,.2f}]. Review gateway log."
+                add_review_issue(
+                    issue_id=f"REVIEW-NET-MATH-{t_id}",
+                    rule_id=RULE_NET_MATH,
+                    desc=desc,
+                    amount=diff,
+                    order_id=o_id,
+                    tx_id=t_id,
+                    exposure_key=f"EXPOSURE-TX-{t_id}",
+                    affected_rows=[str(rec["index"])]
+                )
+                flag = AnomalyFlag(
+                    rule_id=RULE_NET_MATH,
+                    rule_name=RULE_METADATA[RULE_NET_MATH]["name"],
+                    severity="MEDIUM",
+                    classification="REVIEW_REQUIRED",
+                    description=desc,
+                    amount_at_risk=float(diff)
+                )
+                add_flag_if_missing(rec["flags"], flag)
+
+        # RULE 5: HIGH_FEE_DETECTED (REVIEW_REQUIRED) - ONLY IF SOURCE FEE WAS SUPPLIED
+        if has_source_fee and gross > Decimal("0.00") and fee > Decimal("0.00"):
             fee_pct = float((fee / gross) * Decimal("100.00"))
             curr_threshold = fee_thresholds_by_currency.get(curr, 8.0)
             curr_median = median_fee_by_currency.get(curr, 3.0)
